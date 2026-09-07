@@ -1,10 +1,40 @@
-// 自动连播助手 - 内容脚本（注入所有帧，含递归 iframe 扫描）
+// 自动连播助手 - 内容脚本（仅在常见视频/网课平台注入）
 (function () {
   'use strict';
 
   const IS_TOP = (() => {
     try { return window.self === window.top; } catch (e) { return false; }
   })();
+
+  // 已知视频/网课平台域名：顶层 frame 在这些网站或包含 video 元素时正常工作。
+  // 其余页面顶层 frame 直接退出，不绑定事件、不创建面板，避免无关网页触发。
+  const KNOWN_VIDEO_HOSTS = [
+    'webtrn.cn', 'bilibili.com', 'youku.com', 'iqiyi.com', 'v.qq.com',
+    'study.163.com', 'icourse163.org', 'xuetangx.com', 'zhihuishu.com',
+    'imooc.com', 'chaoxing.com', 'open.163.com', 'ke.qq.com', 'gaodun.com',
+    'gaoxiaobang.com', 'duobei.com', 'xuexi.cn', 'docin.com', 'doc88.com',
+    'youtube.com', 'vimeo.com', 'twitch.tv', 'douyin.com', 'kuaishou.com',
+    'huya.com', 'douyu.com'
+  ];
+
+  function isKnownHost() {
+    const h = (location.hostname || '').toLowerCase();
+    for (let i = 0; i < KNOWN_VIDEO_HOSTS.length; i++) {
+      const k = KNOWN_VIDEO_HOSTS[i];
+      if (h === k || h.endsWith('.' + k)) return true;
+    }
+    return false;
+  }
+
+  function hasVideoElement() {
+    try { return document.querySelectorAll('video').length > 0; } catch (e) { return false; }
+  }
+
+  // 顶层 frame 严格早退：不在已知平台且没有 video 元素时，整个 IIFE 立即返回，
+  // 不再绑定任何事件监听器、不再创建悬浮面板、不再扫描 DOM。
+  if (IS_TOP && !isKnownHost() && !hasVideoElement()) {
+    return;
+  }
 
   const DEFAULTS = {
     enabled: true,
@@ -36,7 +66,7 @@
   let lastGlobalNextAt = 0;
 
   // ---------- 设置同步 ----------
-  const SETTINGS_VERSION = '1.7.7';
+  const SETTINGS_VERSION = '1.7.8';
   function loadSettings(cb) {
     try {
       chrome.storage.sync.get(Object.assign({ settingsVersion: '' }, DEFAULTS), (res) => {
