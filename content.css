@@ -1,0 +1,206 @@
+#autoplayer-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  width: 260px;
+  background: #1f2430;
+  color: #e6e6e6;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  font: 13px/1.5 -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+  user-select: none;
+}
+
+#autoplayer-panel .ap-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+#autoplayer-panel .ap-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+#autoplayer-panel .ap-status {
+  margin-left: auto;
+  font-size: 12px;
+  color: #52c41a;
+  background: rgba(82, 196, 26, 0.15);
+  padding: 1px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+#autoplayer-panel .ap-status.ap-off {
+  color: #ff7875;
+  background: rgba(255, 120, 117, 0.15);
+}
+
+#autoplayer-panel .ap-min {
+  background: transparent;
+  border: none;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 14px;
+  width: 20px;
+  padding: 0;
+}
+
+#autoplayer-panel .ap-body {
+  padding: 10px 12px;
+}
+
+#autoplayer-panel .ap-body.ap-hidden {
+  display: none;
+}
+
+#autoplayer-panel .ap-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+#autoplayer-panel .ap-row input {
+  cursor: pointer;
+}
+
+#autoplayer-panel .ap-info {
+  font-size: 12px;
+  color: #9aa0a6;
+  margin-bottom: 8px;
+}
+
+#autoplayer-panel .ap-btn {
+  width: 100%;
+  padding: 7px;
+  border: none;
+  border-radius: 6px;
+  background: #2f81f7;
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#autoplayer-panel .ap-btn:hover {
+  background: #4a93f9;
+}
+
+#autoplayer-panel .ap-btn-ghost {
+  background: rgba(255, 255, 255, 0.08);
+  color: #c7ccd4;
+  margin-top: 6px;
+}
+
+#autoplayer-panel .ap-btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* 进度条 */
+#autoplayer-panel .ap-progress {
+  margin-bottom: 10px;
+}
+
+#autoplayer-panel .ap-progress-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #c7ccd4;
+  margin-bottom: 4px;
+}
+
+#autoplayer-panel .ap-progress-bar,
+#autoplayer-panel .ap-course-bar {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+#autoplayer-panel .ap-progress-fill,
+#autoplayer-panel .ap-course-fill {
+  height: 100%;
+  width: 0%;
+  background: #2f81f7;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+#autoplayer-panel .ap-course-fill {
+  background: #52c41a;
+}
+
+/* 课程统计 */
+#autoplayer-panel .ap-stats {
+  margin-bottom: 10px;
+}
+
+#autoplayer-panel .ap-stat {
+  display: inline-block;
+  font-size: 11px;
+  margin-right: 8px;
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+
+#autoplayer-panel .ap-stat.ap-done {
+  color: #52c41a;
+  background: rgba(82, 196, 26, 0.15);
+}
+
+#autoplayer-panel .ap-stat.ap-cur {
+  color: #2f81f7;
+  background: rgba(47, 129, 247, 0.15);
+}
+
+#autoplayer-panel .ap-stat.ap-pend {
+  color: #9aa0a6;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+#autoplayer-panel .ap-course-bar {
+  margin-top: 8px;
+  margin-bottom: 4px;
+}
+
+#autoplayer-panel .ap-course-pct {
+  font-size: 11px;
+  color: #9aa0a6;
+  text-align: right;
+}
+
+/* 调试日志 */
+#autoplayer-panel .ap-debug-toggle {
+  font-size: 11px;
+  color: #9aa0a6;
+  text-align: center;
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+#autoplayer-panel .ap-logs {
+  display: none;
+  max-height: 120px;
+  overflow-y: auto;
+  margin-top: 6px;
+  padding: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #b8bdc4;
+}
+
+#autoplayer-panel .ap-logs.ap-logs-show {
+  display: block;
+}
+
+#autoplayer-panel .ap-log-line {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 2px 0;
+}

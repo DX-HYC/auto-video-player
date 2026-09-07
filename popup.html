@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 240px; margin: 0; font: 13px/1.5 -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif; background: #fff; color: #222; }
+    .wrap { padding: 14px; }
+    h1 { font-size: 14px; margin: 0 0 10px; }
+    .row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; }
+    .row:last-of-type { border-bottom: none; }
+    .hint { color: #999; font-size: 11px; margin-top: 10px; }
+    input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; }
+    button { width: 100%; margin-top: 12px; padding: 8px; border: none; border-radius: 6px; background: #2f81f7; color: #fff; cursor: pointer; font-size: 13px; }
+    button:hover { background: #4a93f9; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>▶ 自动连播助手</h1>
+    <div class="row"><span>总开关</span><input type="checkbox" id="enabled"></div>
+    <div class="row"><span title="部分平台可能检测到非自然播放行为并弹出警告，建议关闭">暂停自动续播 ⚠️</span><input type="checkbox" id="autoResume"></div>
+    <div class="row"><span>播完自动下一集</span><input type="checkbox" id="autoNext"></div>
+    <button id="apply">保存设置</button>
+    <div class="hint">设置会实时同步到已打开的页面。</div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
