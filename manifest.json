@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "自动连播助手",
-  "version": "1.7.8",
+  "version": "1.7.9",
   "description": "自动识别网页中的视频与播放列表：视频暂停自动续播，播放结束自动点击下一个。仅在常见视频/网课平台生效。",
   "permissions": ["storage"],
   "host_permissions": ["<all_urls>"],
