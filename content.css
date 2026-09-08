@@ -70,6 +70,34 @@
   cursor: pointer;
 }
 
+/* 倍速选择 */
+#autoplayer-panel .ap-speed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+#autoplayer-panel .ap-speed-label {
+  font-size: 12px;
+  color: #c7ccd4;
+}
+
+#autoplayer-panel .ap-speed-row select {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e6e6e6;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 5px;
+  padding: 3px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#autoplayer-panel .ap-speed-row select option {
+  background: #1f2430;
+  color: #e6e6e6;
+}
+
 #autoplayer-panel .ap-info {
   font-size: 12px;
   color: #9aa0a6;
