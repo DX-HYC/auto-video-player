@@ -41,8 +41,13 @@
     autoResume: false,     // 默认关闭自动续播，降低被平台检测为违规插件的风险
     autoNext: true,
     resumeDelay: 1200,
+    speedEnabled: false,   // 默认关闭倍速，避免与平台倍速冲突或触发检测
+    playbackRate: 1,       // 默认 1 倍速，最高 5 倍速
     debug: false
   };
+
+  // 可选倍速档位（最高 5x）
+  const SPEED_OPTIONS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5];
 
   let settings = Object.assign({}, DEFAULTS);
   const boundVideos = new WeakSet();
@@ -66,7 +71,7 @@
   let lastGlobalNextAt = 0;
 
   // ---------- 设置同步 ----------
-  const SETTINGS_VERSION = '1.7.8';
+  const SETTINGS_VERSION = '1.7.9';
   function loadSettings(cb) {
     try {
       chrome.storage.sync.get(Object.assign({ settingsVersion: '' }, DEFAULTS), (res) => {
@@ -92,7 +97,10 @@
       for (const k of Object.keys(changes)) {
         if (k in settings) { settings[k] = changes[k].newValue; dirty = true; }
       }
-      if (dirty && IS_TOP) updateUI();
+      if (dirty) {
+        if (changes.playbackRate || changes.speedEnabled) applySpeedToAll();
+        if (IS_TOP) updateUI();
+      }
     });
   } catch (e) {}
 
@@ -254,6 +262,8 @@
     const video = e.target;
     currentVideo = video;
     if (video === lastEndedVideo) { lastEndedVideo = null; handlingEnd = false; }
+    // 播放器可能在加载新视频时重置倍速，这里重新应用
+    applySpeed(video);
   }
 
   let lastTimeReport = 0;
@@ -283,14 +293,38 @@
     }
   }
 
+  // ---------- 视频：倍速播放 ----------
+  function currentRate() {
+    const r = parseFloat(settings.playbackRate);
+    return isFinite(r) && r > 0 ? r : 1;
+  }
+
+  function applySpeed(video) {
+    if (!video) return;
+    try {
+      const rate = settings.speedEnabled ? currentRate() : 1;
+      if (video.playbackRate !== rate) {
+        video.playbackRate = rate;
+      }
+    } catch (e) {}
+  }
+
+  function applySpeedToAll() {
+    try {
+      queryVideos(document).forEach(applySpeed);
+    } catch (e) {}
+  }
+
   function attachVideo(video) {
     if (!video || boundVideos.has(video)) return;
     boundVideos.add(video);
     video.addEventListener('pause', onPause);
     video.addEventListener('ended', onEnded);
     video.addEventListener('playing', onPlaying);
-    video.addEventListener('play', () => { currentVideo = video; });
+    video.addEventListener('play', () => { currentVideo = video; applySpeed(video); });
     video.addEventListener('timeupdate', onTimeUpdate);
+    // 立即应用一次倍速（若已开启）
+    applySpeed(video);
     log('绑定视频', video.currentSrc || video.src || '(无src)');
   }
 
@@ -1029,6 +1063,20 @@
       '<div class="ap-body" id="ap-body">' +
         '<label class="ap-row" title="部分平台可能检测到非自然播放行为并弹出警告"><span>暂停自动续播 ⚠️</span><input type="checkbox" id="ap-resume"></label>' +
         '<label class="ap-row"><span>播完自动下一集</span><input type="checkbox" id="ap-next"></label>' +
+        '<label class="ap-row"><span>倍速播放</span><input type="checkbox" id="ap-speed"></label>' +
+        '<div class="ap-speed-row">' +
+          '<span class="ap-speed-label">播放速度</span>' +
+          '<select id="ap-speed-val">' +
+            '<option value="1">1.0x</option>' +
+            '<option value="1.25">1.25x</option>' +
+            '<option value="1.5">1.5x</option>' +
+            '<option value="2">2.0x</option>' +
+            '<option value="2.5">2.5x</option>' +
+            '<option value="3">3.0x</option>' +
+            '<option value="4">4.0x</option>' +
+            '<option value="5">5.0x</option>' +
+          '</select>' +
+        '</div>' +
         '<div class="ap-progress">' +
           '<div class="ap-progress-label"><span id="ap-progress-text">当前进度 --:-- / --:--</span><span id="ap-progress-pct">0%</span></div>' +
           '<div class="ap-progress-bar"><div class="ap-progress-fill" id="ap-progress-fill"></div></div>' +
@@ -1045,6 +1093,8 @@
 
     const resumeChk = panel.querySelector('#ap-resume');
     const nextChk = panel.querySelector('#ap-next');
+    const speedChk = panel.querySelector('#ap-speed');
+    const speedVal = panel.querySelector('#ap-speed-val');
     const minBtn = panel.querySelector('#ap-min');
     const body = panel.querySelector('#ap-body');
     const nextBtn = panel.querySelector('#ap-nextbtn');
@@ -1055,6 +1105,17 @@
 
     resumeChk.addEventListener('change', () => { settings.autoResume = resumeChk.checked; saveSettings(); updateStatus(); });
     nextChk.addEventListener('change', () => { settings.autoNext = nextChk.checked; saveSettings(); updateStatus(); });
+    speedChk.addEventListener('change', () => {
+      settings.speedEnabled = speedChk.checked;
+      saveSettings();
+      applySpeedToAll();
+      updateStatus();
+    });
+    speedVal.addEventListener('change', () => {
+      settings.playbackRate = parseFloat(speedVal.value) || 1;
+      saveSettings();
+      applySpeedToAll();
+    });
     minBtn.addEventListener('click', () => {
       const hide = body.classList.toggle('ap-hidden');
       minBtn.textContent = hide ? '+' : '—';
@@ -1108,6 +1169,9 @@
     if (!panel) return;
     panel.querySelector('#ap-resume').checked = !!settings.autoResume;
     panel.querySelector('#ap-next').checked = !!settings.autoNext;
+    panel.querySelector('#ap-speed').checked = !!settings.speedEnabled;
+    const sv = panel.querySelector('#ap-speed-val');
+    if (sv) sv.value = String(currentRate());
     updateStatus();
     updateInfo();
   }
@@ -1115,7 +1179,7 @@
   function updateStatus() {
     if (!panel) return;
     const st = panel.querySelector('#ap-status');
-    const running = settings.enabled && (settings.autoResume || settings.autoNext);
+    const running = settings.enabled && (settings.autoResume || settings.autoNext || settings.speedEnabled);
     st.textContent = running ? '运行中' : '已暂停';
     st.classList.toggle('ap-off', !running);
   }
