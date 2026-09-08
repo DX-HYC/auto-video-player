@@ -10,6 +10,7 @@
     .row:last-of-type { border-bottom: none; }
     .hint { color: #999; font-size: 11px; margin-top: 10px; }
     input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; }
+    select { padding: 3px 6px; border: 1px solid #ccc; border-radius: 5px; font-size: 12px; cursor: pointer; }
     button { width: 100%; margin-top: 12px; padding: 8px; border: none; border-radius: 6px; background: #2f81f7; color: #fff; cursor: pointer; font-size: 13px; }
     button:hover { background: #4a93f9; }
   </style>
@@ -20,6 +21,19 @@
     <div class="row"><span>总开关</span><input type="checkbox" id="enabled"></div>
     <div class="row"><span title="部分平台可能检测到非自然播放行为并弹出警告，建议关闭">暂停自动续播 ⚠️</span><input type="checkbox" id="autoResume"></div>
     <div class="row"><span>播完自动下一集</span><input type="checkbox" id="autoNext"></div>
+    <div class="row"><span>倍速播放</span><input type="checkbox" id="speedEnabled"></div>
+    <div class="row"><span>播放速度</span>
+      <select id="playbackRate">
+        <option value="1">1.0x</option>
+        <option value="1.25">1.25x</option>
+        <option value="1.5">1.5x</option>
+        <option value="2">2.0x</option>
+        <option value="2.5">2.5x</option>
+        <option value="3">3.0x</option>
+        <option value="4">4.0x</option>
+        <option value="5">5.0x</option>
+      </select>
+    </div>
     <button id="apply">保存设置</button>
     <div class="hint">设置会实时同步到已打开的页面。</div>
   </div>
