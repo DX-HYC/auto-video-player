@@ -1,4 +1,26 @@
 <!DOCTYPE html>
+<!--
+  =============================================================================
+  自动连播助手 (Auto Video Player)
+
+  著作权所有 (c) 2026 胡昱晨 (hu_yu_chen)。保留所有权利。
+
+  本文件为「自动连播助手」项目的组成部分，受《中华人民共和国著作权法》及
+  国际著作权条约保护，作品自创作完成之日起自动享有著作权。
+
+  开源授权：本项目以 MIT 许可证开源，完整条款见 LICENSE 文件。
+            依据 MIT 条款，任何副本或实质性部分均须保留本版权声明。
+
+  署名保护：不得删除、篡改、隐匿或伪造本版权声明及作者署名；
+            未经权利人书面许可，任何人不得宣称自己为本作品的原始作者，
+            亦不得以作者名义进行宣传、推广或背书。
+
+  修改标注：修改本文件并再行分发时，须显著标注「已修改」及修改日期。
+
+  Copyright (c) 2026 胡昱晨 (hu_yu_chen). All rights reserved.
+  Licensed under the MIT License - see the LICENSE file for full terms.
+  =============================================================================
+-->
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -13,12 +35,55 @@
     select { padding: 3px 6px; border: 1px solid #ccc; border-radius: 5px; font-size: 12px; cursor: pointer; }
     button { width: 100%; margin-top: 12px; padding: 8px; border: none; border-radius: 6px; background: #2f81f7; color: #fff; cursor: pointer; font-size: 13px; }
     button:hover { background: #4a93f9; }
+    .copyright {
+      margin-top: 12px;
+      padding-top: 8px;
+      border-top: 1px solid #eee;
+      color: #8a8f98;
+      font-size: 10px;
+      line-height: 1.5;
+      text-align: center;
+      user-select: none;
+    }
+    .copyright b { color: #666; font-weight: 600; }
+    .plat-title {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #888;
+      font-weight: 600;
+    }
+    .plat-list { margin: 6px 0 2px; }
+    .plat {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 7px 8px;
+      border: 1px solid #eee;
+      border-radius: 6px;
+      margin-bottom: 6px;
+      cursor: pointer;
+    }
+    .plat input { margin-top: 2px; flex: 0 0 auto; }
+    .plat-main { flex: 1 1 auto; }
+    .plat-name { font-size: 13px; font-weight: 600; color: #333; }
+    .plat-desc { font-size: 11px; color: #999; margin-top: 2px; line-height: 1.4; }
+    .plat-frozen {
+      font-size: 10px;
+      color: #b06a00;
+      background: #fff5e0;
+      border-radius: 3px;
+      padding: 0 4px;
+      margin-left: 6px;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>▶ 自动连播助手</h1>
     <div class="row"><span>总开关</span><input type="checkbox" id="enabled"></div>
+    <div class="plat-title">平台启停</div>
+    <div class="plat-list" id="platList"></div>
+    <div class="row"><span title="刷新页面或跳到下一集后，自动替你点下第一次播放；之后你手动暂停就不再插手">进入页面自动起播</span><input type="checkbox" id="autoStart"></div>
     <div class="row"><span title="部分平台可能检测到非自然播放行为并弹出警告，建议关闭">暂停自动续播 ⚠️</span><input type="checkbox" id="autoResume"></div>
     <div class="row"><span>播完自动下一集</span><input type="checkbox" id="autoNext"></div>
     <div class="row"><span>倍速播放</span><input type="checkbox" id="speedEnabled"></div>
@@ -36,6 +101,11 @@
     </div>
     <button id="apply">保存设置</button>
     <div class="hint">设置会实时同步到已打开的页面。</div>
+    <div class="copyright">
+      <b>© 2026 胡昱晨 (hu_yu_chen)</b><br>
+      原创作品 · 保留所有权利 · MIT 授权<br>
+      禁止删除作者署名或冒称原创
+    </div>
   </div>
   <script src="popup.js"></script>
 </body>
