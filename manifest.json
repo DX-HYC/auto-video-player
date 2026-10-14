@@ -1,13 +1,23 @@
 {
   "manifest_version": 3,
   "name": "自动连播助手",
-  "version": "1.7.9",
-  "description": "自动识别网页中的视频与播放列表：视频暂停自动续播，播放结束自动点击下一个。仅在常见视频/网课平台生效。",
-  "permissions": ["storage"],
+  "version": "2.0.1",
+  "author": "胡昱晨 (hu_yu_chen)",
+  "description": "© 2026 胡昱晨 (hu_yu_chen) 原创作品，保留所有权利｜自动识别网页视频与播放列表：暂停自动续播、播完自动下一集、支持倍速。MIT 授权，禁止删除署名或冒称原创。",
+  "permissions": ["storage", "alarms", "scripting"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "host_permissions": ["<all_urls>"],
+  "web_accessible_resources": [
+    {
+      "resources": ["shadow_bridge.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "自动连播助手",
+    "default_title": "自动连播助手 © 2026 胡昱晨 (hu_yu_chen)",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
@@ -23,6 +33,7 @@
     {
       "matches": [
         "*://*.webtrn.cn/*",
+        "*://*.jxnu.edu.cn/*",
         "*://*.bilibili.com/*",
         "*://*.youku.com/*",
         "*://*.iqiyi.com/*",
@@ -51,7 +62,7 @@
       ],
       "js": ["content.js"],
       "css": ["content.css"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": true
     }
   ]
