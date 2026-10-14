@@ -1,3 +1,27 @@
+/*!
+ * 自动连播助手 (Auto Video Player)
+ * -----------------------------------------------------------------------------
+ * 著作权所有 (c) 2026 胡昱晨 (hu_yu_chen)。保留所有权利。
+ *
+ * 本文件为「自动连播助手」项目的组成部分，受《中华人民共和国著作权法》及
+ * 国际著作权条约保护，作品自创作完成之日起自动享有著作权。
+ *
+ * 开源授权：本项目以 MIT 许可证开源，完整条款见 LICENSE 文件。
+ *           依据 MIT 条款，任何副本或实质性部分均须保留本版权声明。
+ *
+ * 署名保护：不得删除、篡改、隐匿或伪造本版权头及作者署名；
+ *           未经权利人书面许可，任何人不得宣称自己为本作品的原始作者，
+ *           亦不得以作者名义进行宣传、推广或背书。
+ *
+ * 修改标注：修改本文件并再行分发时，须显著标注「已修改」及修改日期。
+ *
+ * 免责声明：本作品按「现状」（AS IS）提供，不提供任何明示或默示担保。
+ *
+ * Copyright (c) 2026 胡昱晨 (hu_yu_chen). All rights reserved.
+ * Licensed under the MIT License - see the LICENSE file for full terms.
+ * This copyright notice must be retained in all copies or substantial portions.
+ * -----------------------------------------------------------------------------
+ */
 // 自动连播助手 - 内容脚本（仅在常见视频/网课平台注入）
 (function () {
   'use strict';
@@ -9,13 +33,69 @@
   // 已知视频/网课平台域名：顶层 frame 在这些网站或包含 video 元素时正常工作。
   // 其余页面顶层 frame 直接退出，不绑定事件、不创建面板，避免无关网页触发。
   const KNOWN_VIDEO_HOSTS = [
-    'webtrn.cn', 'bilibili.com', 'youku.com', 'iqiyi.com', 'v.qq.com',
+    'webtrn.cn', 'jxnu.edu.cn', 'bilibili.com', 'youku.com', 'iqiyi.com', 'v.qq.com',
     'study.163.com', 'icourse163.org', 'xuetangx.com', 'zhihuishu.com',
     'imooc.com', 'chaoxing.com', 'open.163.com', 'ke.qq.com', 'gaodun.com',
     'gaoxiaobang.com', 'duobei.com', 'xuexi.cn', 'docin.com', 'doc88.com',
     'youtube.com', 'vimeo.com', 'twitch.tv', 'douyin.com', 'kuaishou.com',
     'huya.com', 'douyu.com'
   ];
+
+  // ---------------------------------------------------------------------------
+  // 平台策略隔离（v2.0.0）
+  // 目的：让每个平台的专属逻辑拥有明确的边界，改动其中一个平台时不会波及另一个。
+  //  - whitelist 由域名自动判定 → ACTIVE_PROFILE
+  //  - 平台专属代码块统一走 profileAllows(id) 准入
+  //  - 未识别的平台归为 'generic'，此时两套专属逻辑都被放行（向后兼容，
+  //    不会因为平台换了域名就彻底失效）
+  //  - 前台可单独关闭某个平台：关闭后该域名上扩展完全不动（早退）
+  // ---------------------------------------------------------------------------
+  const PLATFORMS = [
+    {
+      id: 'whaty', name: '网梯科技', hosts: ['webtrn.cn'],
+      desc: '.s_point 目录 · completestate 完成标记',
+      frozen: true  // 已冻结：非必要不再改动，改动必须通过 tests/selftest_whaty_frozen.js
+    },
+    {
+      id: 'jxnu', name: '江西师范大学', hosts: ['jxnu.edu.cn'],
+      desc: '百家云播放器接管 · 目录百分比进度'
+    },
+    { id: 'generic', name: '通用兜底', hosts: [], desc: '其余视频站点的基础连播能力' }
+  ];
+  const PLATFORM_IDS = PLATFORMS.map(p => p.id);
+
+  function detectPlatformByHost() {
+    const h = (location.hostname || '').toLowerCase();
+    for (const p of PLATFORMS) {
+      for (const d of p.hosts) {
+        if (h === d || h.endsWith('.' + d)) return p.id;
+      }
+    }
+    return 'generic';
+  }
+
+  let ACTIVE_PROFILE = 'generic';
+  function refreshProfile() { ACTIVE_PROFILE = detectPlatformByHost(); return ACTIVE_PROFILE; }
+  function platformInfo(id) { return PLATFORMS.filter(p => p.id === (id || ACTIVE_PROFILE))[0] || PLATFORMS[2]; }
+  function plateinfoFrozen() { const p = platformInfo(); return !!p.frozen; }
+
+  // 某个平台的前台开关是否打开（默认全部开启）
+  function platformEnabled(id) {
+    const ps = settings.platforms;
+    if (!ps || typeof ps !== 'object') return true;
+    return ps[id] !== false;
+  }
+  // 当前页面所属平台是否被允许工作
+  function activePlatformAllowed() { return platformEnabled(ACTIVE_PROFILE); }
+
+  // 平台专属代码的准入闸门：
+  //   明确处于该平台 → 放行；明确处于"另一个"平台 → 拦住（这就是隔离的核心）；
+  //   处于 generic（未识别到已知平台）→ 放行，避免平台换域名后功能整体失效。
+  function profileAllows(id) {
+    if (ACTIVE_PROFILE === id) return platformEnabled(id);
+    if (ACTIVE_PROFILE === 'generic') return true;
+    return false;
+  }
 
   function isKnownHost() {
     const h = (location.hostname || '').toLowerCase();
@@ -30,14 +110,24 @@
     try { return document.querySelectorAll('video').length > 0; } catch (e) { return false; }
   }
 
-  // 顶层 frame 严格早退：不在已知平台且没有 video 元素时，整个 IIFE 立即返回，
-  // 不再绑定任何事件监听器、不再创建悬浮面板、不再扫描 DOM。
-  if (IS_TOP && !isKnownHost() && !hasVideoElement()) {
-    return;
+  // 顶层 frame 严格早退：不在已知平台且没有 video 元素时，不绑定监听、不建面板、不扫描。
+  // 注意：v1.8.8 起 content script 在 document_start 运行（为抢在播放器库之前装
+  // Shadow DOM 钩子），此时 DOM 还没解析、video 元素多半不存在，因此把判断
+  // 延迟到 init() 里做 —— 若在顶层立即判断，带视频的普通网页会被误判早退。
+  function shouldEarlyExit() {
+    // 前台关闭了当前页面所属平台：连面板都不建，彻底不动作
+    if (!activePlatformAllowed()) return true;
+    return IS_TOP && !isKnownHost() && !hasVideoElement();
   }
 
   const DEFAULTS = {
     enabled: true,
+    // 各平台是否启用（前台可勾选）。关闭的平台所属域名上，扩展完全不动作。
+    platforms: { whaty: true, jxnu: true, generic: true },
+    // 「进入页面 / 跳到下一集后，自动开始播放第一次」——连播的核心诉求，默认开启。
+    // 与 autoResume 的区别：autoResume 是"已在播却停了要不要救回来"（受平台检测风险约束，
+    // 默认关闭）；autoStart 只负责每一节的首次起播，之后若用户主动暂停就不会再插手。
+    autoStart: true,
     autoResume: false,     // 默认关闭自动续播，降低被平台检测为违规插件的风险
     autoNext: true,
     resumeDelay: 1200,
@@ -51,6 +141,18 @@
 
   let settings = Object.assign({}, DEFAULTS);
   const boundVideos = new WeakSet();
+  // 用户主动暂停的视频：前台可见时的暂停（且未开启自动续播）视为人为操作，
+  // 保播/起播逻辑不得抢启，避免和用户"手动暂停"打架；重新播放后自动解除。
+  const userPaused = new WeakSet();
+  // 运行时已完成记账：部分 SPA 平台（如 jxnu zjpt）跳转后 URL 与目录高亮不变、
+  // 完成状态延迟更新，若不本地记账会反复跳回同一集。
+  // 带 10 分钟有效期：万一当前项识别偶发错误，误标的课时会自行恢复为"未完成"，
+  // 不会永久跳过，保证"播完自动补齐漏看课时"的能力不受影响。
+  const localDoneMap = new Map(); // el -> 记账时间戳
+  const LOCAL_DONE_TTL = 10 * 60 * 1000;
+  function markLocalDone(el) {
+    try { if (el) localDoneMap.set(el, Date.now()); } catch (e) {}
+  }
   let currentVideo = null;
   let lastEndedVideo = null;
   let handlingEnd = false;
@@ -71,18 +173,30 @@
   let lastGlobalNextAt = 0;
 
   // ---------- 设置同步 ----------
-  const SETTINGS_VERSION = '1.7.9';
+  const SETTINGS_VERSION = '2.0.0';
   function loadSettings(cb) {
     try {
       chrome.storage.sync.get(Object.assign({ settingsVersion: '' }, DEFAULTS), (res) => {
-        settings = Object.assign({}, DEFAULTS, res || {});
-        // 版本迁移：新版默认关闭 autoResume，若旧设置仍开启则强制关闭一次
-        if ((res || {}).settingsVersion !== SETTINGS_VERSION) {
+        const r = res || {};
+        settings = Object.assign({}, DEFAULTS, r);
+        // platforms 可能被存成不完整对象或 null（其他版本写入过），补齐缺失项，缺的一律视为启用
+        const ps = (settings.platforms && typeof settings.platforms === 'object') ? settings.platforms : {};
+        settings.platforms = {};
+        PLATFORM_IDS.forEach(id => { settings.platforms[id] = ps[id] !== false; });
+        // 只在"从未初始化过"时补写默认值与版本号。
+        // 旧版本曾在这里每逢升级就强制把 autoResume 关掉 —— 那会把用户手动开启的选择
+        // 悄悄抹掉（表现为"明明勾了自动续播却没反应"）。用户的选择必须被尊重。
+        const virgin = !r.settingsVersion;
+        if (virgin) {
           settings.autoResume = false;
-          try {
-            chrome.storage.sync.set({ autoResume: false, settingsVersion: SETTINGS_VERSION });
-          } catch (e) {}
+          settings.autoStart = true;
         }
+        // 旧版本没有 autoStart 字段：升级后按"已初始化"处理会读到 undefined，
+        // 此处兜底为默认开启（否则升级后反而不会自动起播）。
+        if (typeof settings.autoStart !== 'boolean') settings.autoStart = true;
+        try {
+          if (virgin) chrome.storage.sync.set({ autoResume: false, autoStart: true, settingsVersion: SETTINGS_VERSION });
+        } catch (e) {}
         if (cb) cb();
       });
     } catch (e) { if (cb) cb(); }
@@ -98,6 +212,11 @@
         if (k in settings) { settings[k] = changes[k].newValue; dirty = true; }
       }
       if (dirty) {
+        // platforms 可能被存成不完整对象，补齐缺失项，缺的一律视为启用
+        const ps = (settings.platforms && typeof settings.platforms === 'object') ? settings.platforms : {};
+        const fixed = {};
+        PLATFORM_IDS.forEach(id => { fixed[id] = ps[id] !== false; });
+        settings.platforms = fixed;
         if (changes.playbackRate || changes.speedEnabled) applySpeedToAll();
         if (IS_TOP) updateUI();
       }
@@ -129,6 +248,15 @@
   }
 
   // ---------- 工具 ----------
+  // 判断元素是否属于本扩展自己的悬浮面板。
+  // 面板是注入到页面 DOM 里的，若不排除，扩展在页面里查找"下一集"按钮 / 播放按钮 /
+  // 目录容器时会命中自己的按钮（例如面板上的"▶ 立即播放下一集"），导致点击无效。
+  function isOwnEl(el) {
+    try {
+      return !!(el && el.closest && el.closest('[data-ap-own]'));
+    } catch (e) { return false; }
+  }
+
   function isVisible(el) {
     if (!el || !el.getClientRects || !el.getClientRects().length) return false;
     try {
@@ -143,8 +271,31 @@
     root = root || document;
     let els;
     try { els = root.querySelectorAll(sel); } catch (e) { return null; }
-    for (const el of els) if (isVisible(el)) return el;
+    // 排除本扩展自己的面板元素，避免把自己注入的按钮当成平台的按钮
+    for (const el of els) if (isVisible(el) && !isOwnEl(el)) return el;
     return null;
+  }
+
+  // 派发一套完整的鼠标事件序列（pointerdown → mousedown → mouseup → click）。
+  // Vue / Ant Design 这类框架常监听 pointerdown 或用 .self 修饰符，
+  // 单纯 el.click() 不会触发它们的处理器，表现为"点了没反应"。
+  function fireFullClick(el) {
+    if (!el) return false;
+    try {
+      const r = el.getBoundingClientRect();
+      const x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2);
+      const common = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, detail: 1 };
+      const seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+      seq.forEach(type => {
+        try {
+          const E = (type === 'pointerdown' || type === 'pointerup') ? window.PointerEvent : window.MouseEvent;
+          el.dispatchEvent(new E(type, common));
+        } catch (e) {}
+      });
+      return true;
+    } catch (e) {
+      try { el.click(); return true; } catch (e2) { return false; }
+    }
   }
 
   function copyText(text) {
@@ -188,7 +339,7 @@
     return video.parentElement || document;
   }
 
-  // 递归查询 video（open Shadow DOM + 同域 iframe）
+  // 递归查询 video（open Shadow DOM + 同域 iframe + 同域 object/embed 嵌套文档）
   function queryVideos(root, depth) {
     depth = depth || 0;
     if (depth > 6) return [];
@@ -203,6 +354,13 @@
         try {
           const d = f.contentWindow && f.contentWindow.document;
           if (d && d !== root) queryVideos(d, depth + 1).forEach(v => out.push(v));
+        } catch (e) {}
+      });
+      // 扫描同域 object/embed（也是嵌套浏览上下文，部分播放器藏在里面）
+      root.querySelectorAll('object, embed').forEach(f => {
+        try {
+          const d = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+          if (d) queryVideos(d, depth + 1).forEach(v => out.push(v));
         } catch (e) {}
       });
     } catch (e) {}
@@ -227,23 +385,188 @@
     });
   }
 
+  // ---------- Shadow DOM 桥：找到藏在「关闭 shadowRoot」里的真实播放器 ----------
+  // jxnu zjpt 等平台把课程播放器的 <video> 放在 closed Shadow DOM 里，
+  // querySelectorAll 永远查不到（页面上可见的 video 全是摄像头/人脸检测空壳）。
+  // 对策：把 shadow_bridge.js 注入页面主世界（先试内联 <script>，被页面 CSP 拦截
+  // 就请 background 用 chrome.scripting 注入）。桥会截获 attachShadow 的 closed
+  // 引用，把 video 状态写到 documentElement 的 data-ap-shadow-videos 属性，
+  // 本侧轮询读取，并经 data-ap-cmd 下发 play/rate 命令。
+  let shadowBridgeRequested = false;
+  function injectShadowBridge() {
+    if (shadowBridgeRequested) return;
+    shadowBridgeRequested = true;
+    const requestViaBackground = () => {
+      try {
+        chrome.runtime.sendMessage({ type: 'apInjectShadowBridge' }, () => { void chrome.runtime.lastError; });
+      } catch (e) {}
+    };
+    // 三通道并行（桥脚本自带一次性守卫，重复注入无害）：
+    // A. 同步内联：XHR 取回桥源码后以内联脚本执行 —— 在 document_start 阶段同步跑在
+    //    所有页面脚本之前，保证 attachShadow 钩子先于播放器库安装（错过时机，
+    //    closed shadowRoot 的引用就永远拿不到了）。这是 <script src> 异步加载给不了的保证。
+    // B. 原生注册：background 已用 chrome.scripting.registerContentScripts(world:'MAIN',
+    //    runAt:'document_start') 常驻注册，由浏览器在每帧文档创建时原生注入（首选，Chrome 111+）。
+    // C. script src 直连 + D. chrome.scripting 主世界注入：兜底。
+    let inlineOk = false;
+    try {
+      const url = chrome.runtime.getURL('shadow_bridge.js');
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, false); // 同步：确保钩子在本轮立即安装
+      xhr.send(null);
+      if (xhr.status === 200 && /__apShadowBridgeInstalled/.test(xhr.responseText)) {
+        const s = document.createElement('script');
+        s.textContent = xhr.responseText;
+        (document.head || document.documentElement).appendChild(s);
+        s.remove();
+        inlineOk = /^1@/.test(document.documentElement.getAttribute('data-ap-shadow-ok') || '');
+      }
+    } catch (e) {}
+    try {
+      const s = document.createElement('script');
+      s.src = chrome.runtime.getURL('shadow_bridge.js');
+      s.onload = () => s.remove();
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+    requestViaBackground();
+    // 2s 后校验：桥是否真的装上了（原生注册的通道在重载扩展后的首个页面不生效，
+    // 需要下一次导航才注入 —— 所以这里给用户明确提示）
+    setTimeout(() => {
+      try {
+        const attr = document.documentElement.getAttribute('data-ap-shadow-ok') || '';
+        const ok = /^1@/.test(attr);
+        const timing = parseInt((attr.split('@')[1] || '0'), 10) || 0;
+        const roots = document.documentElement.getAttribute('data-ap-shadow-roots');
+        if (ok) {
+          // 时机很关键：>1000ms 说明桥是后补注入的，attachShadow 钩子错过了
+          // 早期创建的 closed 容器，"容器 0" 就不可信
+          log('Shadow桥已注入（主世界，内联:' + (inlineOk ? '是' : '否') +
+              '，时机:' + timing + 'ms' + (timing > 1000 ? ' ⚠偏晚' : '') + '）',
+              '已截获关闭Shadow容器:', roots == null ? '0' : roots, '个');
+        } else {
+          log('Shadow桥注入未生效：请彻底关闭并重开浏览器后重试（原生注册需要重新导航才生效）');
+        }
+      } catch (e) {}
+    }, 2000);
+  }
+
+  function readShadowVideos() {
+    try {
+      const raw = document.documentElement.getAttribute('data-ap-shadow-videos');
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  }
+
+  function shadowRealVideos() {
+    return readShadowVideos().filter(v => v && !v.iframe);
+  }
+
+  function hasShadowVideo() {
+    try { return shadowRealVideos().length > 0; } catch (e) { return false; }
+  }
+
+  // 把桥上报的 shadow video 转成与 getLocalVideoState 同构的数据，参与全局聚合
+  function shadowAsState() {
+    return shadowRealVideos().map(v => ({
+      currentTime: v.t || 0,
+      duration: v.d || 0,
+      paused: !!v.p,
+      ended: !!v.e,
+      src: v.s || '',
+      readyState: 1,
+      real: true,
+      from: 'shadow'
+    }));
+  }
+
+  let lastShadowCmdAt = 0;
+  function shadowCmd(action, value) {
+    try {
+      const now = Date.now();
+      if (action === 'play' && now - lastShadowCmdAt < 800) return;
+      if (action === 'play') lastShadowCmdAt = now;
+      document.documentElement.setAttribute('data-ap-cmd', JSON.stringify({ action: action, value: value, ts: now }));
+    } catch (e) {}
+  }
+
+  let shadowAnnounced = false;
+  let lastShadowEndedHandledAt = 0;
+  let lastShadowPlayLogAt = 0;
+  // 周期检查：起播 / 倍速 / 播完跳下一集（仅顶层调度）
+  function checkShadowVideos() {
+    try {
+      const vids = readShadowVideos();
+      const real = vids.filter(v => v && !v.iframe);
+      const crossFrames = vids.filter(v => v && v.iframe);
+      if (!shadowAnnounced && (real.length || crossFrames.length)) {
+        shadowAnnounced = true;
+        log('已在关闭 Shadow DOM 中找到播放器：video', real.length, '个',
+            crossFrames.length ? ('| 跨域iframe ' + crossFrames.length + '个: ' + crossFrames.map(f => f.iframe).join(' | ').slice(0, 300)) : '');
+      }
+      if (!IS_TOP || !settings.enabled) return;
+
+      if (real.length) {
+        // 起播：开启自动续播，或还没怎么播（ currentTime < 15，刚跳转来的新课时）
+        const needPlay = real.some(v => !v.e && v.p && (settings.autoResume || (v.t || 0) < 15));
+        if (needPlay) {
+          // 同一播放命令最多每 15 秒提示一次，避免日志每 3 秒刷屏
+          const nowP = Date.now();
+          if (nowP - (lastShadowPlayLogAt || 0) > 15000) {
+            lastShadowPlayLogAt = nowP;
+            log('Shadow播放器未起播，下发播放命令');
+          }
+          shadowCmd('play');
+        }
+        // 倍速
+        if (settings.speedEnabled) shadowCmd('rate', currentRate());
+      }
+
+      // 播完 → 下一集（顶层调度，8 秒去抖）
+      const now = Date.now();
+      if (settings.autoNext && real.some(v => v.e) && now - lastShadowEndedHandledAt > 8000) {
+        lastShadowEndedHandledAt = now;
+        log('Shadow播放器播完，自动下一集');
+        try { if (localList.current) markLocalDone(localList.current.el); } catch (e) {}
+        dispatchNext('Shadow播放器：', true);
+      }
+    } catch (e) {}
+  }
+
+
   // ---------- 视频：暂停续播 ----------
-  function resumeVideo(video) {
-    if (!settings.enabled || !settings.autoResume) return;
+  // force=true 表示绕过"暂停自动续播"开关强制恢复（用于页面不可见时的被动暂停）
+  function resumeVideo(video, force) {
+    if (!settings.enabled) return;
+    if (!force && !settings.autoResume) return;
     if (!video || video.ended) return;
     if (!video.paused) return;
-    // 不再直接调用 video.play()，避免被平台检测到非自然播放行为；改为模拟点击播放按钮
+    // 后台定时器会被节流，被动恢复不再等待，尽快拉起播放
+    const delay = force ? 0 : (settings.resumeDelay || 0);
     setTimeout(() => {
-      if (!settings.enabled || !settings.autoResume) return;
+      if (!settings.enabled) return;
+      if (!force && !settings.autoResume) return;
       if (!video.paused || video.ended) return;
-      clickPlayButton(video);
-    }, settings.resumeDelay || 0);
+      startPlayback(video);
+    }, delay);
   }
 
   function onPause(e) {
     const video = e.target;
     if (!video || video.ended) return;
-    resumeVideo(video);
+    // 页面不可见（窗口最小化 / 切到后台标签页）时发生的暂停，通常来自浏览器节流行为
+    // 或平台的防挂机检测，而不是用户主动暂停 —— 这种应当尝试恢复，否则挂机看课会被中断。
+    const passive = isDocHidden();
+    if (passive) {
+      userPaused.delete(video);
+      log('检测到后台被动暂停，尝试恢复播放');
+    } else if (!settings.autoResume && video.currentTime > 15) {
+      // 前台且未开启"暂停自动续播"、且已经看了一会儿 —— 才认定为用户主动暂停，
+      // 记录下来防止起播逻辑抢启。开头（currentTime <= 15）的暂停可能是平台切集、
+      // 缓冲或防挂机导致的被动暂停，仍需要由 ensurePlaying 拉起（网梯平台常见）。
+      userPaused.add(video);
+    }
+    resumeVideo(video, passive);
   }
 
   function onEnded(e) {
@@ -252,7 +575,10 @@
     if (handlingEnd && lastEndedVideo === video) return;
     handlingEnd = true;
     lastEndedVideo = video;
+    userPaused.delete(video);
     log('视频播放结束');
+    // 本地记账：把当前课时标记为已完成，防止平台完成状态延迟导致反复跳同一集
+    try { if (localList.current && localList.current.el) markLocalDone(localList.current.el); } catch (err) {}
     const handled = clickNext(false, true);
     postToTop({ type: 'ended', handled: !!handled });
     setTimeout(() => { handlingEnd = false; }, 2000);
@@ -261,6 +587,7 @@
   function onPlaying(e) {
     const video = e.target;
     currentVideo = video;
+    userPaused.delete(video);
     if (video === lastEndedVideo) { lastEndedVideo = null; handlingEnd = false; }
     // 播放器可能在加载新视频时重置倍速，这里重新应用
     applySpeed(video);
@@ -288,9 +615,670 @@
     for (const s of sels) {
       try {
         const btn = root.querySelector(s);
-        if (btn && isVisible(btn)) { btn.click(); return; }
+        if (btn && isVisible(btn)) { btn.click(); return true; }
       } catch (e) {}
     }
+    return false;
+  }
+
+  // 视频是否真的有可播放的媒体源（MSE/自定义播放器可能没有 src 属性）
+  function hasMediaSource(v) {
+    try {
+      if (v.src || v.currentSrc) return true;
+      if (v.srcObject) return true;
+      if (v.querySelector && v.querySelector('source[src]')) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // 判断一个 video 是不是"真实可播放的媒体"，而不是页面模板里的空壳占位元素。
+  // jxnu zjpt 等平台会把摄像头 / 人脸检测的 <video>（无 src、readyState=0、duration=NaN）
+  // 常驻在页面上（父级如 show-face / show_camera / my-video）。这些元素既无法起播也读不到
+  // 进度，若把它们当成"播放器已可控"，会直接关掉按目录进度驱动的兜底逻辑 ——
+  // v1.8.6 之前"播完不跳下一集"正是栽在这里。
+  function isRealVideo(v) {
+    if (!v) return false;
+    try {
+      if (hasMediaSource(v)) return true;
+      if (v.readyState > 0) return true;
+      if (isFinite(v.duration) && v.duration > 0) return true;
+      if (v.currentTime > 0) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // 同上，但作用于跨帧传递过来的纯数据对象（只有 currentTime/duration/src 等字段）
+  function isRealVideoObj(o) {
+    if (!o) return false;
+    try {
+      if (o.real === false) return false;
+      if (o.src) return true;
+      if (o.readyState > 0) return true;
+      if (isFinite(o.duration) && o.duration > 0) return true;
+      if (o.currentTime > 0) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // 点击播放器画面区域：绝大多数自定义播放器点击画面=播放/暂停切换。
+  // 只在"目录进度确认卡住"的兜底路径调用（有进度反馈保护），不会打断正在播的视频。
+  function clickVideoScreen() {
+    const RE_PLAYER = /player|video|bofang|shipin|media/i;
+    const RE_BAD = /face|camera|haij?\w*|danmu|danmaku|catalog|menu|list|panel|nav/i;
+    let best = null, bestArea = 0;
+    try {
+      document.querySelectorAll('div, section').forEach(el => {
+        if (isOwnEl(el)) return;
+        const cls = (el.getAttribute('class') || '') + ' ' + (el.id || '');
+        if (!RE_PLAYER.test(cls) || RE_BAD.test(cls)) return;
+        if (!isVisible(el)) return;
+        const r = el.getBoundingClientRect();
+        const area = r.width * r.height;
+        // 播放器画面通常占屏幕很大一块
+        if (area > bestArea && r.width > 200 && r.height > 150) { best = el; bestArea = area; }
+      });
+      if (best) {
+        fireFullClick(best);
+        log('点击播放器画面区域：', ((best.getAttribute('class') || best.tagName) + '').slice(0, 40),
+            '(', Math.round(best.getBoundingClientRect().width), 'x',
+            Math.round(best.getBoundingClientRect().height), ')');
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // 向播放器容器派发空格键：不少播放器绑定空格=播放/暂停。合成键盘事件虽然
+  // isTrusted=false，但页面的 keydown 监听器照常触发。
+  function pressSpaceOnPlayer() {
+    try {
+      const target = clickVideoScreen ? document.body : document.body;
+      const opts = { key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true, cancelable: true };
+      let el = null;
+      try {
+        document.querySelectorAll('div').forEach(d => {
+          if (el) return;
+          const cls = (d.getAttribute('class') || '');
+          if (/player|video-box|my-video/i.test(cls) && isVisible(d) && !isOwnEl(d)) el = d;
+        });
+      } catch (e) {}
+      const t = el || document.body;
+      t.dispatchEvent(new KeyboardEvent('keydown', opts));
+      t.dispatchEvent(new KeyboardEvent('keyup', opts));
+      document.body.dispatchEvent(new KeyboardEvent('keydown', opts));
+      document.body.dispatchEvent(new KeyboardEvent('keyup', opts));
+      log('已向播放器容器派发空格键（' + ((el && el.getAttribute('class')) || 'body').slice(0, 30) + '）');
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // 页面级播放按钮兜底：用于"页面上找不到可控制的 video"（自定义播放器）的情况。
+  // 只命中"明确的播放控件"，且排除下一集/倍速/全屏等干扰按钮，避免误点。
+  function clickPagePlayButton() {
+    const RE_BAD = /下一|上一|上一个|下一个|倍速|全屏|音量|静音|清晰度|弹幕|投屏|下载|收藏|暂停|目录|章节|课时/;
+    const SELS = [
+      '.vjs-big-play-button', '.vjs-play-control',
+      '.bpx-player-ctrl-play', '.prism-play-btn',
+      '.xgplayer-play', '.dplayer-play-icon',
+      '.video-player-play', '.player-play-btn', '.play-btn',
+      'button[aria-label*="播放"]', 'button[title*="播放"]',
+      '[class*="play" i][class*="btn" i]', '[class*="play" i][class*="icon" i]',
+      '[class*="bofang" i]',
+      // 最后的宽泛兜底：任何类名含 play 的可见元素（已排除目录区与自身面板）
+      '[class*="play" i]'
+    ];
+    try {
+      for (const s of SELS) {
+        let els = [];
+        try { els = Array.prototype.slice.call(document.querySelectorAll(s)); } catch (e) { continue; }
+        for (const el of els) {
+          if (isOwnEl(el)) continue;
+          // 排除课程目录区：目录里的播放图标（如 anticon-play-circle）点了会跳课时，不是"恢复播放"
+          try { if (localList.container && localList.container.contains(el)) continue; } catch (e) {}
+          if (!isVisible(el)) continue;
+          const t = (getAllText(el) || '').trim();
+          const label = (el.getAttribute('title') || '') + ' ' + (el.getAttribute('aria-label') || '');
+          const cls = (el.getAttribute('class') || '');
+          const all = t + ' ' + label + ' ' + cls;
+          if (RE_BAD.test(t + ' ' + label)) continue;
+          // 播放器控件：类名/文案含 play/播放，或可见文本就是"播放"
+          if (/play|bofang/i.test(cls) || /播放|开始播放/.test(t + ' ' + label)) {
+            fireFullClick(el);
+            log('点击页面播放按钮：', (t || label || cls).slice(0, 30));
+            return true;
+          }
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // ==================================================================
+  // 无 <video> 元素的自定义播放器接管模块（canvas / WebAudio 型）
+  // ------------------------------------------------------------------
+  // jxnu zjpt 使用百家云 bplayer：画面渲染在 <canvas id="bplayer-ffplayer">，
+  // 声音走 <audio class="bplayer-audio">（或 WebAudio），页面里根本没有 <video>。
+  // 后果有三：① 面板读不到进度（永远 0%）；② 收不到 ended 事件（播完不跳下一集）；
+  // ③ 所有"存在真实 video 才起播"的分支全部落空，连播彻底失效。
+  // 对策：直接从播放器的 DOM / 控制条里读状态，点它自己的控件，并把它伪装成
+  // 一条标准 video 状态（from:'custom'）注入既有流水线，复用 ended → 下一集逻辑。
+  // 关键保护：本模块只在"本帧找不到真实可播 video"时生效，网梯等原生 video
+  // 平台完全不会走到这里。
+  // ==================================================================
+
+  // 解析 "31:30" / "1:02:03" 形式的播放时间文本
+  function parseClock(t) {
+    if (t == null) return -1;
+    const m = String(t).trim().match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
+    if (!m) return -1;
+    const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+    if (m[3]) return a * 3600 + b * 60 + parseInt(m[3], 10);
+    return a * 60 + b;
+  }
+
+  // 从播放器 DOM 读出播放位置 / 总时长。
+  // 坑点：百家云的时间容器是 <span class="text duration">（内部包着 played-time 与
+  // total-time）。若用 [class*="duration"] 去找总时长，querySelector 会先命中这个外层
+  // 容器，textContent 变成 "00:38/31:30"，parseClock 必然失败 → 时长永远是 0。
+  // 因此这里：① 只用精确类名，跳过还包着其它时间元素的容器；② 实在选不到时，
+  //    在播放器文本里按 "00:38 / 31:30" 的成对格式兜底扫描。
+  function readPlayerClock(root) {
+    const out = { cur: -1, dur: -1 };
+    const grab = (sel, key) => {
+      try {
+        const els = root.querySelectorAll(sel);
+        for (const el of els) {
+          // 跳过容器：内部还嵌套着别的时间元素的一律不算叶子节点
+          if (el.querySelector('[class*="time" i], [class*="duration" i]')) continue;
+          const v = parseClock(el.textContent);
+          if (v >= 0) { out[key] = v; return true; }
+        }
+      } catch (e) {}
+      return false;
+    };
+    grab('.played-time, [class*="played-time" i], .current-time, [class*="current-time" i], .bplayer-current', 'cur');
+    grab('.total-time, [class*="total-time" i], .duration-time, [class*="duration-time" i], .vjs-duration-display', 'dur');
+    if (out.cur < 0 || out.dur < 0) {
+      try {
+        const txt = String(root.textContent || '').replace(/\s+/g, ' ');
+        const m = txt.match(/(\d{1,3}:\d{2}(?::\d{2})?)\s*[\/／|]\s*(\d{1,3}:\d{2}(?::\d{2})?)/);
+        if (m) {
+          if (out.cur < 0) out.cur = parseClock(m[1]);
+          if (out.dur < 0) out.dur = parseClock(m[2]);
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
+
+  const CUSTOM_PLAYER_ROOT_SELS = [
+    '.bplayer-wrap', '.bplayer-container', '.bplayer-media-wrap',
+    '.prism-player', '.xgplayer', '.dplayer', '.vjs-player', '.jwplayer',
+    '.player-container', '.player-wrap', '.video-player', '#play_box', '.play_box', '#player'
+  ];
+
+  // 找出页面上的自定义播放器容器（取面积最大的那个）
+  // 结果做 500ms 缓存：本函数会被多个 tick 反复调用，每次遍历十余组选择器并读取
+  // getBoundingClientRect（强制回流）会拖慢页面。
+  //
+  // 【平台隔离 v2.0.0】整个「无 <video> 的自定义播放器接管」模块是应 jxnu（百家云
+  // bplayer）需求引入的，放在这里做总闸门：网梯 profile 下直接返回 null，
+  // 于是后续所有自定义播放器逻辑都不会执行 —— 新平台的改动物理上无法影响网梯。
+  let customRootCache = { el: null, ts: 0 };
+  function findCustomPlayerRoot() {
+    if (!profileAllows('jxnu')) return null;
+    try {
+      const c = customRootCache;
+      if (c.el && Date.now() - c.ts < 500 && document.contains(c.el)) return c.el;
+    } catch (e) {}
+    const seen = new Set();
+    let best = null, bestArea = 0;
+    const tryAdd = (el) => {
+      try {
+        if (!el || !el.getBoundingClientRect || isOwnEl(el) || seen.has(el)) return;
+        seen.add(el);
+        // 目录区里的东西永远不是播放器
+        if (localList.container && localList.container.contains(el)) return;
+        const cls = (el.id ? el.id + ' ' : '') + (typeof el.className === 'string' ? el.className : '');
+        if (!/bplayer|jwplayer|dplayer|xgplayer|videojs|vjs-|prism|player|video/i.test(cls)) return;
+        // 必须具备播放器特征之一：canvas 画面 / media 元素 / 控制条按钮 / 时间显示
+        const hasCanvas = !!el.querySelector('canvas');
+        const hasMedia  = !!el.querySelector('audio, video, object, embed');
+        const hasTime   = !!el.querySelector('[class*="played-time" i], [class*="total-time" i], [class*="current-time" i], [class*="duration" i]');
+        const hasBtn    = !!el.querySelector('[class*="play-btn" i], [class*="play-control" i], [class*="play-icon" i]');
+        if (!(hasCanvas || hasMedia || (hasTime && hasBtn))) return;
+        if (!isVisible(el)) return;
+        const r = el.getBoundingClientRect();
+        if (r.width < 200 || r.height < 120) return;
+        const area = r.width * r.height;
+        if (area > bestArea) { best = el; bestArea = area; }
+      } catch (e) {}
+    };
+    try {
+      CUSTOM_PLAYER_ROOT_SELS.forEach(s => {
+        try { Array.prototype.forEach.call(document.querySelectorAll(s), tryAdd); } catch (e) {}
+      });
+    } catch (e) {}
+    // 精细化：若选中的是播放器外层壳（#play_box / #player），而下级有带"播放状态类"的
+    // 真正容器（如 .bplayer-wrap.bplayer-playing），改用它 —— 播放中/暂停的判定信号就在那上面，
+    // 直接用外层壳会丢失这唯一的 UI 状态来源。
+    if (best) {
+      try {
+        const inner = Array.prototype.slice.call(
+          best.querySelectorAll('[class*="bplayer-wrap" i], [class*="player-wrap" i], [class*="player-container" i]')
+        ).filter(el => {
+          const c = (typeof el.className === 'string') ? el.className : '';
+          return isVisible(el) && /bplayer-(playing|paused)|\bis-playing\b|\bis-paused\b/i.test(c);
+        })[0];
+        if (inner) best = inner;
+      } catch (e) {}
+    }
+    customRootCache = { el: best, ts: Date.now() };
+    return best;
+  }
+
+  // 读取自定义播放器的实时状态（当前时间 / 总时长 / 是否在播 / 是否播完）
+  function readCustomPlayer() {
+    const root = findCustomPlayerRoot();
+    if (!root) return null;
+    const st = { root: root, media: null, cur: 0, dur: 0, paused: true, ended: false, pct: -1, label: '' };
+    try {
+      const rootCls = (root.id ? root.id + ' ' : '') + (typeof root.className === 'string' ? root.className : '');
+      st.label = String(rootCls).replace(/\s+/g, ' ').slice(0, 40);
+
+      const media = root.querySelector('audio, video');
+      // 只有当 media 元素真的加载了资源时才优先采信它。
+      // 反例：<audio class="bplayer-audio"> 是百家云模板里的占位元素（无 src、
+      // readyState 0、currentTime 恒为 0）——若采信它，播放位置会被永远读成 0。
+      let usableMedia = false;
+      try {
+        let srcObjVal = null;
+        try { srcObjVal = media && media.srcObject; } catch (e) {}
+        usableMedia = !!media && (!!(media.src || media.currentSrc || srcObjVal || (media.querySelector && media.querySelector('source[src]'))) ||
+                                 media.readyState > 0 || media.currentTime > 0);
+      } catch (e) {}
+
+      const clock = readPlayerClock(root);
+      if (usableMedia) {
+        st.media = media;
+        st.cur = media.currentTime || 0;
+        st.dur = isFinite(media.duration) && media.duration > 0 ? media.duration : 0;
+        st.paused = !!media.paused;
+        st.ended = !!media.ended;
+        // media 能拿到时长就信它，否则仍用控制条上的总时长文本
+        if (!st.dur && clock.dur > 0) st.dur = clock.dur;
+      } else {
+        st.media = null;
+        if (clock.cur >= 0) st.cur = clock.cur;
+        if (clock.dur > 0) st.dur = clock.dur;
+      }
+      // 能否追踪播放位置（读不到就不能用"位置没动"当故障依据）
+      st.trackable = usableMedia || clock.cur >= 0 || clock.dur > 0;
+      // 进度百分比：优先用已播/总时长，否则读取度条宽度
+      if (st.dur > 0) {
+        st.pct = Math.min(100, Math.max(0, (st.cur / st.dur) * 100));
+        if (st.cur >= st.dur - 1.5) st.ended = true;
+      } else {
+        const bar = pick('[class*="progress-played" i], [class*="progress-current" i], [class*="played-bar" i]');
+        const w = bar && bar.style ? bar.style.width : '';
+        const m2 = String(w || '').match(/([\d.]+)%/);
+        if (m2) st.pct = parseFloat(m2[1]);
+        const tEl = pick('[class*="played-time" i], [class*="current-time" i]');
+        const ttEl = pick('[class*="total-time" i], [class*="duration" i]');
+        const c2 = parseClock(tEl && tEl.textContent), d2 = parseClock(ttEl && ttEl.textContent);
+        if (d2 > 0 && c2 >= 0 && c2 >= d2 - 2) st.ended = true;
+      }
+
+      // 播放状态判定：UI 信号优先（UI 最贴近用户感知），其次 media 元素
+      let uiPlaying = null;
+      if (/\bbplayer-playing\b|\bis-playing\b|\bplaying-state\b|\bpaused\b/i.test(rootCls)) {
+        uiPlaying = /bplayer-playing|is-playing|playing-state/i.test(rootCls) && !/\bbplayer-paused\b|\bis-paused\b/i.test(rootCls);
+      }
+      if (uiPlaying === null) {
+        const btn = pick('[class*="play-btn" i], [class*="play-control" i], [class*="play-icon" i]');
+        if (btn) {
+          const html = (btn.innerHTML || '').slice(0, 500);
+          const bcls = (typeof btn.className === 'string') ? btn.className : '';
+          const sig = bcls + ' ' + html;
+          // 按钮显示的是"暂停条"，说明此刻正在播放
+          if (/\b(pause|stop)\b|icon-pause|pause-icon/i.test(sig)) uiPlaying = true;
+          else if (/\b(play)\b/i.test(sig)) uiPlaying = false;
+        }
+      }
+      st.playing = (uiPlaying === null) ? (!!media && !media.paused && !media.ended) : uiPlaying;
+    } catch (e) {}
+    return st;
+  }
+
+  // 把自定义播放器伪装成标准 video 状态上报（仅在"本帧无真实 video"时注入）
+  function customPlayerAsState() {
+    try {
+      if (queryVideos(document).some(isRealVideo)) return null;
+      if (hasShadowVideo()) return null;
+      const st = readCustomPlayer();
+      if (!st) return null;
+      return {
+        currentTime: st.cur || 0,
+        duration: st.dur || 0,
+        paused: !st.playing,
+        ended: !!st.ended,
+        src: '',
+        readyState: 1,
+        real: true,
+        from: 'custom'
+      };
+    } catch (e) { return null; }
+  }
+
+  function getCustomPlayer() {
+    try { return readCustomPlayer(); } catch (e) { return null; }
+  }
+
+  // 起播动作级联（按"破坏性从小到大"排序，任何一种奏效即止）
+  const customTry = { idx: 0, lastAt: 0 };
+  function customPlayerPlay(step) {
+    const st = readCustomPlayer();
+    if (!st) return false;
+    const root = st.root;
+    const methods = [
+      // ① 直接调 media.play()：幂等，已在播不会有任何副作用
+      function m_media() {
+        const m = st.media;
+        if (!m || m.ended) return false;
+        // 从未加载过资源的占位元素（如百家云模板里的 <audio class="bplayer-audio">）：
+        // 对它调 play() 必然被拒，白等一轮重试，直接跳到点按钮的方式
+        try {
+          let srcObjVal = null;
+          try { srcObjVal = m.srcObject; } catch (e) {}
+          const hasSrc = !!(m.src || m.currentSrc || srcObjVal || (m.querySelector && m.querySelector('source[src]')));
+          if (!hasSrc && m.readyState === 0 && !m.currentTime) return false;
+        } catch (e) {}
+        try {
+          const p = m.play();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+          log('[自定义播放器] 调用 media.play()');
+          return true;
+        } catch (e) { return false; }
+      },
+      // ② 点播放器自带的播放/暂停按钮
+      function m_btn() {
+        const sels = ['[class*="play-btn" i]', '[class*="play-control" i]', '[class*="play-icon" i]',
+                      'button[aria-label*="播放"]', '[class*="big-play" i]', '.vjs-big-play-button'];
+        for (const s of sels) {
+          let el = null;
+          try {
+            Array.prototype.forEach.call(root.querySelectorAll(s), x => { if (!el && isVisible(x)) el = x; });
+          } catch (e) {}
+          if (el) { fireFullClick(el); log('[自定义播放器] 点击自带播放按钮'); return true; }
+        }
+        return false;
+      },
+      // ③ 点画面（canvas）
+      function m_canvas() {
+        let el = null;
+        try { Array.prototype.forEach.call(root.querySelectorAll('canvas'), x => { if (!el && isVisible(x)) el = x; }); } catch (e) {}
+        if (el) { fireFullClick(el); log('[自定义播放器] 点击画面(canvas)'); return true; }
+        return false;
+      },
+      // ④ 点画面容器
+      function m_stage() {
+        const el = (function () {
+          for (const s of ['[class*="media-wrap" i]', '[class*="video-wrap" i]', '[class*="stage" i]', '[class*="screen" i]']) {
+            try {
+              const n = Array.prototype.slice.call(root.querySelectorAll(s)).filter(isVisible)[0];
+              if (n) return n;
+            } catch (e) {}
+          }
+          return null;
+        })();
+        if (el) { fireFullClick(el); log('[自定义播放器] 点击播放器画面区'); return true; }
+        return false;
+      },
+      // ⑤ 派发空格键
+      function m_key() {
+        try {
+          const o = { key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true, cancelable: true };
+          root.dispatchEvent(new KeyboardEvent('keydown', o));
+          root.dispatchEvent(new KeyboardEvent('keyup', o));
+          log('[自定义播放器] 派发空格键');
+          return true;
+        } catch (e) { return false; }
+      }
+    ];
+    const start = (typeof step === 'number') ? step : customTry.idx;
+    for (let k = 0; k < methods.length; k++) {
+      const idx = (start + k) % methods.length;
+      try {
+        if (methods[idx]()) { customTry.idx = (idx + 1) % methods.length; return true; }
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  // 自定义播放器心跳：起播保活 + 播完跳下一集（精度到秒，远快于目录百分比驱动）
+  let customPrev = { cur: -1, at: 0, key: '' };
+  let customAnnounced = false;
+  let customLastJumpAt = 0;
+  let customIgnoreUntil = 0;   // 跳转后的"播完判定静默期"，防止读到上一节的收尾位置连跳两级
+
+  // ---------- 冷启动：每一节的"第一次起播" ----------
+  // 场景：刷新页面 / 点进某个课时 / 由本扩展跳到下一集之后，播放器停在暂停态，
+  //       需要扩展代替用户点下第一个"播放"。
+  // 它与「暂停自动续播」是两件事，必须分开：
+  //   · autoResume 管"播着播着停了要不要救回来" —— 默认关闭以规避平台检测；
+  //   · autoStart 只负责首次起播 —— 一旦播起来就永久收手，之后用户再暂停绝不插手。
+  // 因此这里不能沿用 autoResume 那套 early/currentTime<15 的门槛：
+  // 视频停在 25:01 这种"播放中途"的位置同样必须起播（这正是用户反馈的"必须人工点一次"）。
+  let customBootAt = 0;        // 本次接管（或换源）的起始时刻
+  let customBootBase = -1;     // 接管时的播放位置，用于识别"位置是否推进过"
+  let customBooted = false;    // 本次接管是否已完成首次起播
+  let customBootTries = 0;     // 已尝试轮次
+  let customJumpSeen = 0;      // 已处理过的 lastClickAt 值
+  const CUSTOM_BOOT_WINDOW = 8 * 60 * 1000;   // 冷启动尝试窗口
+  const CUSTOM_BOOT_MAX = 6;                  // 最多尝试轮次，避免无限骚扰
+
+  // 点完起播后按 3s / 8s / 16s 三次复查：没有真的播起来就升级到下一种点击方式。
+  // 铁律：任何一条证据表明"已经在播了"都必须立刻收手 —— 继续点只会把它点成暂停。
+  function customPlayRecheck(base) {
+    [3000, 8000, 16000].forEach(delay => {
+      setTimeout(() => {
+        try {
+          if (!settings.enabled) return;
+          const s2 = readCustomPlayer();
+          if (!s2) return;
+          if (s2.ended || (s2.dur > 0 && s2.cur >= s2.dur - 2)) return;
+          if (s2.playing) { customPrev.at = Date.now(); customBooted = true; return; }
+          if (s2.cur > base + 0.5) { customPrev.at = Date.now(); customBooted = true; return; }
+          customPlayerPlay();
+        } catch (e) {}
+      }, delay);
+    });
+  }
+
+  // 认定为"换了一节课 / 页面重新打开过" → 冷启动状态重置，重新获得一次首次起播机会
+  function customReboot(now, cur) {
+    customBootAt = now;
+    customBootBase = cur;
+    customBooted = false;
+    customBootTries = 0;
+    customTry.idx = 0;          // 新播放器一律从最温和的方式重新开始
+    customPrev.at = now;
+    customPrev.cur = cur;
+  }
+
+  function customPlayerTick() {
+    // 平台被前台停用 → 立刻停手（不撤掉面板，方便用户直接重新打开）
+    if (!settings.enabled || !activePlatformAllowed()) return;
+    let st = null;
+    try { st = readCustomPlayer(); } catch (e) {}
+    if (!st) { customPrev.key = ''; customAnnounced = false; return; }
+    if (!customAnnounced) {
+      customAnnounced = true;
+      log('已接管自定义播放器（本页无 <video>）：', st.label,
+          '| 位置', fmtTime(st.cur) + ' / ' + fmtTime(st.dur),
+          '| 控件', st.trackable
+            ? ('可追踪：' + (st.media ? ('media<' + st.media.tagName.toLowerCase() + '>') : '控制条文本'))
+            : '读不到播放位置（只读 UI 状态）');
+    }
+    const now = Date.now();
+
+    // 「换了新课时」的三个信号，任一命中都重开冷启动窗口：
+    //   ① 播放器容器本身变了（root 类名不同）
+    //   ② 本扩展刚发起过跳转（lastClickAt 变化）—— 解决"跳到下一集却不起播"
+    //   ③ 播放位置大幅倒退 —— 用户手工点了别的课时
+    // ② 尤其关键：SPA 平台切课时播放器 DOM 会被复用，root 类名可能完全一样，
+    //   只靠 ① 会把"新的一节课"误认为"同一个播放器"，导致跳过去之后永远不起播。
+    const newJump = lastClickAt && lastClickAt !== customJumpSeen;
+    // 换 criteria: position dropped significantly relative to last seen
+    const rewound = customBootBase >= 0 && st.cur < customBootBase - 5;
+    if (customPrev.key !== st.label) {
+      customPrev.key = st.label;
+      if (newJump) customJumpSeen = lastClickAt;
+      customReboot(now, st.cur);
+      return;
+    }
+    if (newJump) { customJumpSeen = lastClickAt; customReboot(now, st.cur); return; }
+    if (rewound) {
+      customReboot(now, st.cur);
+      log('[自定义播放器] 检测到切换课时（播放位置回到 ' + fmtTime(st.cur) + '），重新进入首次起播流程');
+      return;
+    }
+    if (st.cur !== customPrev.cur) { customPrev.cur = st.cur; customPrev.at = now; }
+    const stalled = now - customPrev.at;
+
+    // ① 播完 → 下一集
+    //    跳转后 20 秒内不做"播完"判定：SPA 平台切课时播放器是先复用再重建的，
+    //    这期间读到的可能还是上一节的收尾位置，若立即判定播完会连跳跳过一节课。
+    const finished = st.ended || (st.pct >= 99.5 && st.pct >= 0) || (st.dur > 0 && st.cur >= st.dur - 2);
+    if (finished && now >= customIgnoreUntil) {
+      if (!settings.autoNext) return;
+      if (now - customLastJumpAt < 10000) return;
+      // 目录进度驱动等其他路径刚跳转过：不重复跳转，交给新一轮播放器
+      if (lastClickAt && now - lastClickAt < 20000) { customPrev.at = now; return; }
+      customLastJumpAt = now;
+      customPrev.at = now;
+      customIgnoreUntil = now + 20000;
+      try { if (localList.current) markLocalDone(localList.current.el); } catch (e) {}
+      log('[自定义播放器] 已播完（' + fmtTime(st.cur) + ' / ' + fmtTime(st.dur) + '），自动下一集');
+      dispatchNext('自定义播放器播完：', true);
+      return;
+    }
+    // 处于跳转后的静默期且仍显示"已播完"（多半是上一节的残留状态）：
+    // 刷新判停基准让新一轮播放器有干净计时，暂不重复跳转
+    if (finished) { customPrev.at = now; return; }
+
+    // ② 冷启动：本节第一次起播。不受 autoResume 约束，由 settings.autoStart 单独控制。
+    //    冷启动期间独占出手权，避免与下面的保播逻辑重复点击把播放器来回切换。
+    if (!customBooted) {
+      if (settings.autoStart === false) return;
+      // 已经播起来了 → 冷启动达成，窗口关闭
+      if (st.playing || (customBootBase >= 0 && st.cur > customBootBase + 0.5)) {
+        customBooted = true;
+        return;
+      }
+      if (now - customBootAt > CUSTOM_BOOT_WINDOW || customBootTries >= CUSTOM_BOOT_MAX) return;
+      // 给播放器挂载留时间：首次 2.5s 出手（刷新后要尽快开播），重试间隔 6s
+      const wait = customBootTries === 0 ? 2500 : 6000;
+      if (stalled >= wait && now - customTry.lastAt >= 5000) {
+        customBootTries++;
+        customTry.lastAt = now;
+        customPrev.at = now;
+        log('[自定义播放器] 尚未开始播放（停在 ' + fmtTime(st.cur) + ' / ' + fmtTime(st.dur) +
+            '），执行首次自动起播');
+        customPlayerPlay();
+        customPlayRecheck(st.cur);
+      }
+      return;
+    }
+
+    // ③ 保播：本节已经播起来过、后来又停下。除非用户开了"暂停自动续播"，否则视为人为暂停，不救。
+    //    判定基准是"播放位置若干秒没动"，而不是"看起来暂停了"。
+    //    UI 明确显示"播放中"时给足耐心（90 秒）：控制条上的 bplayer-playing 是最贴近
+    //    用户感知的真实状态，仅凭它没被观察到就出手，会把正在播的视频点成暂停。
+    //    极端情况：读不到播放位置（trackable=false）且 UI 说在播 → 一律不动手。
+    if (st.playing && !st.trackable) return;
+    if (stalled < (st.playing ? 90000 : 8000)) return;
+    if (now - customTry.lastAt < 6000) return;
+    const early = st.cur <= 15;                                        // 几乎没开始播
+    const justJumped = lastClickAt && (now - lastClickAt < 90000);      // 刚由本扩展跳过来
+    if (!settings.autoResume && !early && !justJumped) return;
+    customTry.lastAt = now;
+    customPrev.at = now;
+    log('[自定义播放器] 播放位置停在 ' + fmtTime(st.cur) + ' / ' + fmtTime(st.dur) +
+        '（' + Math.round(stalled / 1000) + 's 未推进' + (st.playing ? '，但 UI 显示播放中' : '') + '），尝试起播');
+    const base = st.cur;
+    customPlayerPlay();
+    // 复查：未推进则升级到下一种方式（新课时播放器常需几秒才挂载完成）
+    customPlayRecheck(base);
+  }
+
+  // 启动播放：优先模拟点击播放按钮（更接近真人操作），失败再用 play() 兜底
+  function startPlayback(video) {
+    if (!video || video.ended) return false;
+    try {
+      if (!video.paused) return true;
+      // 没有媒体源的空壳 video（部分平台模板里的占位元素）点了也没用
+      if (!hasMediaSource(video)) return false;
+      if (clickPlayButton(video)) return true;
+      const p = video.play();
+      if (p && typeof p.catch === 'function') {
+        p.catch((err) => {
+          log('play() 失败：', (err && err.name) || '未知', (err && err.message) || '');
+          // 自定义播放器：video 不受控时退回到点击页面上的播放按钮
+          clickPagePlayButton();
+        });
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // 保持播放：供后台看门狗调用。
+  // - 若用户开启了"暂停自动续播"，任何时候的暂停都尝试恢复；
+  // - 否则只在视频几乎没开始播（currentTime 很小）时恢复，用于保证"跳到下一集后能真的播起来"，
+  //   不会打断用户主动的中途暂停。
+  let lastPagePlayAt = 0;
+  function ensurePlaying() {
+    if (!settings.enabled) return;
+    if (!activePlatformAllowed()) return;
+    try {
+      const videos = queryVideos(document);
+      // 只统计"真实可播"的 video：页面常驻的摄像头/人脸检测 <video> 一直处于 playing
+      // 状态，若算进来会误判"已有视频在播"，把页面播放按钮兜底这条唯一出路也堵死。
+      const playing = videos.some(v => isRealVideo(v) && !v.paused && !v.ended);
+      let handled = 0;
+      videos.forEach(v => {
+        if (v.ended) return;
+        if (userPaused.has(v)) return;
+        if (!v.paused) return;
+        // 没有媒体源的空壳 video（平台模板占位元素）起播没有意义，直接跳过
+        if (!hasMediaSource(v)) return;
+        handled++;
+        // 部分平台自定义播放器（如 jxnu zjpt）duration 为 0/未知，不能因此放弃起播：
+        // 未知时长时只按"几乎没有开始播"（currentTime < 2）来判断
+        const unknownDur = !isFinite(v.duration) || v.duration <= 0;
+        const early = unknownDur ? v.currentTime < 2 : v.currentTime < 15;
+        if (!settings.autoResume && !early) return;
+        if (early) log('视频未自动起播，尝试启动');
+        startPlayback(v);
+      });
+
+      // 页面上没有任何可控 video（自定义播放器场景）：退化为点击页面播放按钮。
+      // 仅在"刚跳转过（60 秒内）"或"用户开了自动续播"时才做，避免打断用户手动暂停。
+      // 页面上只有空壳 video（自定义播放器 / 播放器不在 video 元素里）时才点页面播放按钮。
+      // 注意：不能因为"当前有视频在播"以外的条件就乱点，否则可能把正在播的视频点暂停；
+      // 真实 video 存在与否由 isRealVideo 判断，空壳（摄像头/占位）不算。
+      // 若播放器已在关闭 Shadow DOM 中找到（桥已生效），交给 checkShadowVideos 下发命令，不点页面按钮。
+      if (!handled && !playing && !videos.some(isRealVideo) && !hasShadowVideo()) {
+        const now = Date.now();
+        const justJumped = lastClickAt && (now - lastClickAt < 60000);
+        if ((settings.autoResume || justJumped) && now - lastPagePlayAt > 30000) {
+          lastPagePlayAt = now;
+          log('未发现可控 video，尝试接管播放器');
+          // 优先交给自定义播放器模块（带播放位置校验，不会把正在播的视频点成暂停）
+          if (!getCustomPlayer()) clickPagePlayButton();
+        }
+      }
+    } catch (e) {}
   }
 
   // ---------- 视频：倍速播放 ----------
@@ -312,6 +1300,8 @@
   function applySpeedToAll() {
     try {
       queryVideos(document).forEach(applySpeed);
+      // 关闭 Shadow DOM 里的播放器：经主世界桥下发倍率命令
+      if (IS_TOP && hasShadowVideo()) shadowCmd('rate', currentRate());
     } catch (e) {}
   }
 
@@ -321,11 +1311,22 @@
     video.addEventListener('pause', onPause);
     video.addEventListener('ended', onEnded);
     video.addEventListener('playing', onPlaying);
-    video.addEventListener('play', () => { currentVideo = video; applySpeed(video); });
+    video.addEventListener('play', () => { currentVideo = video; userPaused.delete(video); applySpeed(video); });
     video.addEventListener('timeupdate', onTimeUpdate);
     // 立即应用一次倍速（若已开启）
     applySpeed(video);
-    log('绑定视频', video.currentSrc || video.src || '(无src)');
+    // 诊断：输出视频源与状态，便于判断哪些是真实播放器、哪些是模板占位元素
+    try {
+      const parentCls = (video.parentElement && typeof video.parentElement.className === 'string')
+        ? video.parentElement.className.slice(0, 40) : '';
+      log('绑定视频', (video.currentSrc || video.src || '(无src)'),
+          '| 有源:', hasMediaSource(video),
+          '| readyState:', video.readyState,
+          '| duration:', video.duration,
+          '| paused:', video.paused,
+          '| class:', (typeof video.className === 'string' ? video.className : '').slice(0, 40),
+          '| 父级:', parentCls);
+    } catch (e) { log('绑定视频'); }
   }
 
   function scanVideos() {
@@ -335,17 +1336,24 @@
   }
 
   function getLocalVideoState() {
-    return queryVideos(document).map(v => ({
+    const arr = queryVideos(document).map(v => ({
       currentTime: v.currentTime || 0,
       duration: v.duration || 0,
       paused: v.paused,
       ended: v.ended,
-      src: v.currentSrc || v.src || ''
+      src: v.currentSrc || v.src || '',
+      readyState: v.readyState || 0,
+      real: isRealVideo(v)
     }));
+    // 没有 <video> 的自定义播放器：伪装成一条标准状态上报，让面板进度、
+    // 卡结尾检测、"播完自动下一集"等既有逻辑照常生效
+    const cs = customPlayerAsState();
+    if (cs) arr.push(cs);
+    return arr;
   }
 
   function reportVideoState() {
-    localVideos = getLocalVideoState();
+    localVideos = getLocalVideoState().concat(shadowAsState());
     const payload = {
       type: 'state',
       videos: localVideos,
@@ -424,7 +1432,12 @@
   }
 
   // 网梯/whaty-learnspace 平台专用目录识别
+  // 【已冻结 v2.0.0】本函数及其相关分支不再随其他平台的开发改动；
+  // 任何变更必须先让 tests/selftest_whaty_frozen.js 全绿。
+  // 准入：仅在当前 profile 为网梯（或未识别平台的兼容模式）下执行，
+  // 这样 jxnu 分支的改动在物理上不可能影响网梯以外的行为。
   function findWangtiCatalog(doc) {
+    if (!profileAllows('whaty')) return null;
     // 只认真正的课程目录：id/class 含 learnMenu / s_learnlist / learnlist；
     // 注意 .learn-menu（左侧导航）不是课程目录，不在此列
     const directSelectors = '#learnMenu, .s_learnlist, [id*="learnMenu" i], [class*="learnlist" i], [class*="s_learnlist" i]';
@@ -471,6 +1484,7 @@
       try {
         doc.querySelectorAll(s).forEach(el => {
           if (el.offsetParent === null) return;
+          if (isOwnEl(el)) return; // 排除本扩展自己的面板
           const score = looksLikeCatalogContainer(el);
           if (score >= 4) candidates.push({ el, score });
         });
@@ -478,12 +1492,14 @@
     }
     doc.querySelectorAll('ul, ol').forEach(el => {
       if (el.offsetParent === null) return;
+      if (isOwnEl(el)) return; // 排除本扩展自己的面板
       const score = looksLikeCatalogContainer(el);
       if (score >= 6) candidates.push({ el, score });
     });
     if (!candidates.length) {
       doc.querySelectorAll('div').forEach(el => {
         if (el.offsetParent === null) return;
+        if (isOwnEl(el)) return; // 排除本扩展自己的面板
         const liCount = el.querySelectorAll(':scope > div, :scope > li').length;
         if (liCount < 5) return;
         const score = looksLikeCatalogContainer(el) + liCount * 0.3;
@@ -564,7 +1580,10 @@
     walk(container, 0);
 
     // 网梯/whaty-learnspace 平台精准识别：.s_point[itemtype="video"] 直接作为视频课时叶子
-    const sPoints = Array.from(container.querySelectorAll('.s_point[itemtype="video"]'));
+    // 【平台隔离】仅网梯 profile 下生效，避免在整站开了 Anti-Design 结构的其他平台上被误命中
+    const sPoints = profileAllows('whaty')
+      ? Array.from(container.querySelectorAll('.s_point[itemtype="video"]'))
+      : [];
     if (sPoints.length >= 2) {
       const sPointSet = new Set(sPoints);
       // 移除被 .s_point 包含的候选，避免取到内部 .wrap
@@ -608,6 +1627,8 @@
       if (/^(高清|标清|超清|全高清|720p|1080p|480p|speed|倍速|音量|全屏)$/.test(t)) return false;
       if (it.el.closest('.learn-menu, .left-menu, .nav-menu, .course-nav')) return false;
       if (it.el.classList.contains('screen-player-cell')) return false;
+      // 排除播放器内部控件（时长、画质、进度条、倍速菜单等）
+      if (isPlayerControl(it.el)) return false;
       return true;
     });
 
@@ -615,6 +1636,33 @@
     const withDuration = leaves.filter(it => /\d{1,2}:\d{2}(:\d{2})?/.test(it.text));
     if (withDuration.length >= 2 && withDuration.length < leaves.length) {
       leaves = withDuration;
+    }
+
+    // 兜底：SPA 平台（Vue/React）的目录项常无典型 class、无时长文本，
+    // 此时按"同级重复结构"识别：容器下 tag+首个类名相同且数量 >= 2 的一组元素。
+    if (leaves.length < 2) {
+      const groups = new Map();
+      Array.from(container.children).forEach(c => {
+        if (!c || c.nodeType !== 1) return;
+        const cls = (typeof c.className === 'string' ? c.className : '').split(/\s+/)[0] || '';
+        const key = c.tagName + '|' + cls;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(c);
+      });
+      let best = null;
+      groups.forEach(arr => {
+        if (arr.length >= 2 && (!best || arr.length > best.length)) best = arr;
+      });
+      if (best) {
+        const fallbackLeaves = best
+          .filter(el => !isPlayerControl(el))
+          .map(el => ({ el, text: getAllText(el), score: getItemScore(el) }))
+          .filter(it => (it.text || '').trim().length >= 2);
+        if (fallbackLeaves.length >= 2) {
+          log('目录项兜底识别：同级重复结构', fallbackLeaves.length, '项');
+          leaves = fallbackLeaves;
+        }
+      }
     }
 
     const sortByDoc = (arr) => arr.sort((a, b) => {
@@ -633,12 +1681,22 @@
     const text = getAllText(el);
 
     // 网梯/whaty-learnspace 平台：completestate="1" 表示已完成
-    const completeState = el.getAttribute('completestate');
-    if (completeState === '1' || completeState === 'true') return 'completestate';
-    const dataStatus = el.getAttribute('data-status');
-    if (dataStatus === '1' || dataStatus === 'completed' || dataStatus === 'finish') return 'data-status';
+    // 【平台隔离】仅网梯 profile 下采信；在其他平台上这个属性可能有别的含义
+    if (profileAllows('whaty')) {
+      const completeState = el.getAttribute('completestate');
+      if (completeState === '1' || completeState === 'true') return 'completestate';
+    }
 
-    const clsRe = /\b(completed|finished|done|watched|passed|learned|success|finish|complete|wancheng|yiwancheng|yixuexi|yikan|yibofang|gou|dui|checked(?![a-z]))\b/i;
+    // 目录项文本里的学习进度百分比（如 "100%"、"100.0%"）达到 100 视为已完成。
+    // jxnu zjpt 等平台不用 class 标记完成，只在课时上显示百分比进度。
+    // 【平台隔离】百分比达标才算完成，误判会把"还没看完"的课时标成已完成并跳过，
+    // 因此限定在 jxnu profile 下启用。
+    if (profileAllows('jxnu')) {
+      const pm = text.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+      if (pm && parseFloat(pm[1]) >= 99.5) return 'progress';
+    }
+
+    const clsRe =/\b(completed|finished|done|watched|passed|learned|success|finish|complete|wancheng|yiwancheng|yixuexi|yikan|yibofang|gou|dui|checked(?![a-z]))\b/i;
     if (clsRe.test(cls)) return 'class';
     if (/已学完|已完成|已看|已播放|学习进度\s*100|100%/.test(text)) return 'text';
 
@@ -646,19 +1704,33 @@
     const icons = el.querySelectorAll('i, svg, span, em, img, [class*="icon" i]');
     for (const icon of icons) {
       const c = (typeof icon.className === 'string') ? icon.className : '';
-      if (/\b(completed|finished|done|watched|passed|learned|success|finish|complete|wancheng|yiwancheng|yixuexi|yikan|yibofang|gou|dui)\b/i.test(c)) return 'icon-class';
+      if (/\b(completed|finished|done|watched|passed|learned|success|finish|complete|wancheng|yiwancheng|yixue|yixuexi|yikan|yibofang|xuewan|gou|dui)\b/i.test(c)) return 'icon-class';
+      // Ant Design 完成图标：anticon-check-circle / anticon-check（jxnu zjpt 等平台用）
+      if (/anticon-check-circle|check-circle|checkcircle|icon-check|icon-gou|icon-success/i.test(c)) return 'icon-check';
       const t = getAllText(icon);
-      if (/已学完|已完成|已看|已播放/.test(t)) return 'icon-text';
+      if (/已学完|已学习|已学|已完成|已修完|已看|已播放/.test(t)) return 'icon-text';
       const aria = icon.getAttribute('aria-label') || '';
       if (/已学完|已完成|已看|已播放/.test(aria)) return 'icon-aria';
     }
+
+    // 课时内的进度条被撑满（内联样式 width:100%）视为已完成
+    try {
+      const bars = el.querySelectorAll('[style*="width" i]');
+      for (const b of bars) {
+        const m = (b.getAttribute('style') || '').match(/width\s*:\s*([\d.]+)%/i);
+        if (m && parseFloat(m[1]) >= 99.5) return 'progress-bar';
+      }
+    } catch (e) {}
     return false;
   }
 
   function hasCurrentMarker(el) {
     const cls = (typeof el.className === 'string') ? el.className : '';
     // 网梯/whaty-learnspace：s_pointerct / pointerct 表示当前正在学
-    if (/\b(s_pointerct|pointerct|active|current|playing|selected|on|focus|now|cur|zhengzaibofang|bofangzhong|xuexizhong)\b/i.test(cls)) return true;
+    // 【平台隔离】这两个类名仅在网梯 profile 下采信
+    if (profileAllows('whaty') &&
+        /\b(s_pointerct|pointerct)\b/i.test(cls)) return true;
+    if (/\b(active|current|playing|selected|on|focus|now|cur|zhengzaibofang|bofangzhong|xuexizhong)\b/i.test(cls)) return true;
     if (el.getAttribute('aria-current') === 'true' || el.getAttribute('aria-selected') === 'true') return true;
     const icon = el.querySelector('[class*="active" i], [class*="current" i], [class*="selected" i], [class*="bofang" i], [class*="playing" i]');
     if (icon) return true;
@@ -801,16 +1873,237 @@
     return g.test(t.trim());
   }
 
+  // 目录日志降噪：状态没变化时不重复输出（原先每 3 秒刷一大段，把前面日志全冲掉了）
+  let lastListSig = '';
+  let lastListLogAt = 0;
+
+  // 兜底驱动：当完全监听不到 video 元素时（播放器位于跨域 iframe，content script 无法注入，
+  // 收不到 pause/ended 事件），改用"目录课时进度百分比"驱动连播：
+  // 当前课时进度达到 100% 即自动跳下一节。jxnu zjpt 等平台正是这种情况。
+  let fallbackLastPct = -1;
+  let fallbackLastChangeAt = 0;
+  let fallbackLastJumpAt = 0;
+  let fallbackLastResumeAt = 0;
+  let fallbackCurrentKey = '';
+  let catalogDriveSkipLogAt = 0;
+  let catalogDriveAnnounced = false;   // v1.9.1 修复：此前未声明，严格模式下读取直接抛
+                                       // ReferenceError，导致整个目录驱动 tick 每 3 秒崩一次，
+                                       // 起播级联（含四级兜底）一行都执行不到 —— "换个版本还是不自动播放"的真凶。
+
+  // 判断平台是否把当前课时标记为"正在播放"。
+  // 返回 false=确认正在播（不干预）｜true=确认暂停｜null=无法判断。
+  // 实测 jxnu 平台目录上的 pause-circle 是"课时状态"（已开始未完成），并非实时播放状态，
+  // 因此绝不拿它当依据 —— v1.8.7 正因为误判"在播"而永远不起播。改由自定义播放器模块的
+  // "播放位置是否推进"来判定；本函数默认返回 null（不挡路）。
+  // v1.9.1 修复：此前该函数从未定义，调用时抛 ReferenceError。
+  function currentItemPausedByIcon(cur) {
+    try {
+      const st = getCustomPlayer();
+      if (st && st.playing) return false;
+      // UI 没给信号，但播放位置近期推进过 —— 同样按"正在播放"处理
+      if (st && st.trackable && customPrev.at && Date.now() - customPrev.at < 60000) return false;
+    } catch (e) {}
+    return null;
+  }
+
+  // 当前课时的状态图标（Ant Design）。实测（jxnu zjpt）三种图标含义是"课时状态"而非
+  // 实时播放状态：check-circle=已完成、pause-circle=已开始未完成、play-circle=未开始。
+  // 注意：**不能**把 pause-circle 当成"正在播放"——v1.8.7 曾因此误判"在播不干预"，
+  // 导致进度卡住也永远不起播。这里只用来识别"已完成"。
+  function currentItemStateIcon(cur) {
+    try {
+      const icons = cur.el.querySelectorAll('i, span, div, svg');
+      for (const el of icons) {
+        const c = (el.getAttribute && el.getAttribute('class')) || '';
+        if (!c) continue;
+        if (/check-circle|icon-check|icon-wancheng/i.test(c)) return 'check';
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // 点击当前课时行上的"播放"图标（平台自己的控件），用于自定义播放器无法直接控制的场景
+  function clickCurrentItemPlayIcon(cur) {
+    try {
+      const icons = cur.el.querySelectorAll('i, span, div, svg');
+      for (const el of icons) {
+        const c = (el.getAttribute && el.getAttribute('class')) || '';
+        if (!c || !/play-circle|icon-play|icon-bofang/i.test(c)) continue;
+        // 往上找到真正带点击处理的外层（图标本身通常不绑事件）
+        let node = el;
+        for (let i = 0; i < 3 && node.parentElement; i++) {
+          node = node.parentElement;
+          if (node && /course-status|status|play/i.test((node.getAttribute && node.getAttribute('class')) || '')) break;
+        }
+        if (isVisible(node)) {
+          fireFullClick(node);
+          log('点击当前课时的播放图标：', (getAllText(cur.el) || '').slice(0, 24));
+          return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function catalogDrivenTick() {
+    if (!settings.enabled || !settings.autoNext) return;
+    if (!activePlatformAllowed()) return;
+    if (!IS_TOP) return;
+    // 页面里有"真实可播"的 video 时，交给 video 的 ended 事件驱动，这里不插手。
+    // 注意：由自定义播放器模块伪装的 from:'custom' 条目不算 —— 它没有 ended 事件，
+    // 仍需目录进度驱动兜底。
+    if (getAggregatedVideos().some(v => v.from !== 'custom')) return;
+    if (!catalogDriveAnnounced) {
+      catalogDriveAnnounced = true;
+      log('已进入「目录进度驱动」模式：页面无可控 video，按课时进度百分比自动起播与跳下一集');
+    }
+
+    const cur = localList.current;
+    if (!cur) return;
+    const pct = parseItemPercent(cur.text);
+    if (pct < 0) return; // 目录里没有百分比进度，无法驱动
+
+    const now = Date.now();
+    const key = cur.text.slice(0, 48);
+    // 换了课时：重置基准，避免用上一节的进度判断本节
+    if (key !== fallbackCurrentKey) {
+      fallbackCurrentKey = key;
+      fallbackLastPct = pct;
+      fallbackLastChangeAt = now;
+      return;
+    }
+    if (pct !== fallbackLastPct) {
+      fallbackLastPct = pct;
+      fallbackLastChangeAt = now;
+    }
+    const stalled = now - fallbackLastChangeAt;
+
+    // ① 播完 → 跳下一节
+    // 平台把进度刷到 100% 即视为播完；少数平台停在 99%/90% 就不再涨，
+    // 连续无变化超过阈值也判定播完，避免整门课卡死在这一节。
+    // 另外平台把当前课时图标刷成 check-circle（已完成）时，无论百分比多少都立即跳。
+    const iconState = currentItemStateIcon(cur);
+    const finished = iconState === 'check' || pct >= 99.5 ||
+                     (pct >= 95 && stalled > 240000) || (pct >= 90 && stalled > 480000);
+    if (finished) {
+      if (now - fallbackLastJumpAt < 10000) return;
+      fallbackLastJumpAt = now;
+      fallbackLastChangeAt = now;
+      markLocalDone(cur.el);
+      log('课时进度 ' + pct + '% 已播完（播放器不可直接控制，按目录进度驱动下一集）');
+      clickNext(true, true);
+      return;
+    }
+
+    // ② 进度长时间不动 → 说明这一节没播起来（或中途停了），尝试恢复
+    //    只在"确实没在播"时才动手，避免把正在播放的视频点暂停。
+    //    0% 起不来时 35 秒就介入（平台约每 30 秒刷新一次百分比，不能更早误判），
+    //    中途停顿则给 45 秒宽限（可能是网络缓冲）。
+    // 自定义播放器处于可追踪状态时，起播交给 customPlayerTick（按秒级播放位置判定）。
+    // 这里若仍用目录的百分比来判定"卡住"，会因为长视频几十秒才涨 0.1% 而误判，
+    // 进而去点播放按钮/画面/空格键 —— 那几个动作都是"播放↔暂停"开关，会把正在播的视频点停。
+    try {
+      const cp = getCustomPlayer();
+      if (cp && cp.trackable) {
+        if (now - (catalogDriveSkipLogAt || 0) > 60000) {
+          catalogDriveSkipLogAt = now;
+          log('自定义播放器可精准追踪播放位置，起播交由其接管，目录进度只用于判断"是否播完"');
+        }
+        return;
+      }
+    } catch (e) {}
+    if (stalled < (pct <= 0 ? 35000 : 45000)) return;
+    if (now - fallbackLastResumeAt < 60000) return;
+    fallbackLastResumeAt = now;
+    fallbackLastChangeAt = now; // 重新计时，防止连点
+    const pausedByIcon = currentItemPausedByIcon(cur);
+    if (pausedByIcon === false) {
+      log('进度停在 ' + pct + '%，但平台显示正在播放中，不干预');
+      return;
+    }
+    log('课时进度停在 ' + pct + '%（' + Math.round(stalled / 1000) + 's 未变化），尝试起播');
+    // 桥已找到 Shadow 播放器：直接下发播放命令（最精准），不再点页面按钮
+    if (hasShadowVideo()) {
+      shadowCmd('play');
+      log('已向 Shadow 播放器下发播放命令');
+      return;
+    }
+    // 起播级联：控制条播放按钮 → 播放器画面点击 → 空格键 → 课时行播放图标
+    if (clickPagePlayButton()) return;
+    if (clickVideoScreen()) return;
+    if (pressSpaceOnPlayer()) return;
+    clickCurrentItemPlayIcon(cur);
+  }
+  // 从候选中剔除"章节标题"这类非课时元素。
+  // 依据：真正的课时文本通常带课时序号（"1-1"、"2.3"），而章节标题（如 jxnu 平台
+  // 的 SPAN.nav-title）没有序号。仅在"带序号的占多数"时才过滤，避免误伤不带序号的平台。
+  // 判断元素是否是"货真价实的课时项"（带打开资源的 onclick / itemtype=video / 课时类名）。
+  // 用于保护已适配的平台（尤其是网梯），避免序号规则把真课时误判成章节标题。
+  function looksLikeLessonItem(el) {
+    if (!el || !el.getAttribute) return false;
+    try {
+      const onclick = el.getAttribute('onclick') || '';
+      if (/openLearnResItem|openResource|openRes|playVideo|play\(|learnRes|openItem|clickItem/i.test(onclick)) return true;
+      const it = (el.getAttribute('itemtype') || '').toLowerCase();
+      if (it === 'video' || it === 'course' || it === 'lesson') return true;
+      if (el.getAttribute('completestate') != null) return true; // 网梯课时带 completestate
+      const cls = (typeof el.className === 'string') ? el.className : '';
+      if (/\b(s_point|point|lesson|keshi|kecheng|task|resource|res-item|video-item)\b/i.test(cls)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function filterLessonLeaves(leaves) {
+    if (!leaves || leaves.length < 2) return { lessons: leaves || [], headers: [] };
+
+    // 【平台隔离 v2.0.0】序号过滤是为 jxnu 的 "课程序号 + 章节标题混排" 目录设计的，
+    // 它的行为是"剔除不带序号的项"，本质上是有破坏力的（会丢目录项）。
+    // 因此只在 jxnu profile 下启用，其他平台一律不过滤，宁可多认、不可漏认。
+    if (!profileAllows('jxnu')) return { lessons: leaves, headers: [] };
+
+    // 保护 1：网梯/whaty 平台已有精准识别（.s_point[itemtype="video"]），直接跳过过滤，
+    // 绝不让通用规则影响已验证可用的平台。
+    try {
+      const isWangti = leaves.some(x => x.el && x.el.matches &&
+        (x.el.matches('.s_point[itemtype="video"]') || x.el.matches('[itemtype="video"]')));
+      if (isWangti) return { lessons: leaves, headers: [] };
+    } catch (e) {}
+
+    // 先剥掉进度百分比（"80.4%\n1-1 …"），否则 "80.4" 会被误当课时序号
+    const stripPct = (t) => String(t || '').replace(/\d{1,3}(?:\.\d+)?\s*%/g, ' ').replace(/^\s+/, '');
+    const numRe = /^\s*\d{1,2}\s*[-.．、:：]\s*\d{1,2}\b/;
+    const lessons = [], headers = [];
+    leaves.forEach(x => { (numRe.test(stripPct(x.text)) ? lessons : headers).push(x); });
+    if (lessons.length >= 2 && headers.length > 0 && lessons.length >= headers.length) {
+      // 保护 2：若被剔除的候选里有明显是课时的元素，说明序号规则不适用，放弃过滤
+      const risky = headers.some(x => looksLikeLessonItem(x.el));
+      if (risky) return { lessons: leaves, headers: [] };
+      return { lessons, headers };
+    }
+    return { lessons: leaves, headers: [] };
+  }
+
+  // 解析课时项上的学习进度百分比（jxnu 等平台在目录项里显示 "80.4%"）
+  function parseItemPercent(text) {
+    if (!text) return -1;
+    const m = String(text).match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+    if (!m) return -1;
+    const v = parseFloat(m[1]);
+    return isFinite(v) ? v : -1;
+  }
+
   function analyzeList() {
     const container = findCatalogContainer();
     if (!container) {
       localList = { container: null, all: [], leaves: [], chapterHeaders: [], current: null, completed: [], pending: [], leafCount: 0 };
       return;
     }
-    const { leaves, chapterHeaders } = collectItems(container);
+    const { leaves: rawLeaves, chapterHeaders: rawHeaders } = collectItems(container);
+    // 剔除混进来的章节标题（非课时元素），只保留真课时
+    const { lessons: leaves, headers: titleHeaders } = filterLessonLeaves(rawLeaves);
     localList.container = container;
     localList.leaves = leaves;
-    localList.chapterHeaders = chapterHeaders;
+    localList.chapterHeaders = rawHeaders.concat(titleHeaders);
     localList.leafCount = leaves.length;
 
     if (!leaves.length) {
@@ -826,6 +2119,16 @@
     // 例如网梯平台在课程目录上一直保留对当前章节的 s_pointerct，但用户可能手动点了别的课时。
     let current = findCurrentByUrl(leaves) || leaves.find(it => hasCurrentMarker(it.el)) || null;
     let completedByMarker = new Set(leaves.filter(it => hasCompletedMarker(it.el)).map(it => it.el));
+
+    // 合并运行时本地记账的已完成课时（元素仍在当前目录容器内才有效，
+    // SPA 重渲染导致元素被替换后旧记录自动失效）
+    try {
+      const nowDone = Date.now();
+      localDoneMap.forEach((ts, el) => {
+        if (!el || nowDone - ts > LOCAL_DONE_TTL) { localDoneMap.delete(el); return; }
+        if (container.contains(el)) completedByMarker.add(el);
+      });
+    } catch (e) {}
 
     // 防误报：如果所有课时都被标成已完成，而当前还有正在播放且未结束的视频，大概率是误匹配
     const activeVideo = currentVideo;
@@ -863,8 +2166,47 @@
     localList.completed = localList.all.filter(it => it.state === 'completed');
     localList.pending = localList.all.filter(it => it.state === 'pending');
 
-    log('目录分析：共', leaves.length, '项，当前', current ? current.text.slice(0, 30) : '无', '，已播', localList.completed.length, '，待播', localList.pending.length);
+    // 当前课时的学习进度百分比（无 video 可用时用它驱动连播与面板显示）
+    localList.currentPct = localList.current ? parseItemPercent(localList.current.text) : -1;
+
+    const sig = [leaves.length, current ? current.text.slice(0, 30) : '无',
+                 localList.completed.length, localList.pending.length,
+                 localList.currentPct].join('|');
+    const nowMs = Date.now();
+    if (sig === lastListSig && nowMs - lastListLogAt < 60000) return;
+    lastListSig = sig;
+    lastListLogAt = nowMs;
+
+    log('目录分析：共', leaves.length, '项，当前', current ? current.text.slice(0, 30) : '无',
+        '，进度', localList.currentPct >= 0 ? localList.currentPct + '%' : '未知',
+        '，已播', localList.completed.length, '，待播', localList.pending.length);
     log('当前URL:', location.href.slice(0, 160), '| title:', (document.title || '').slice(0, 40));
+    log('当前平台：' + platformInfo().name + '（' + ACTIVE_PROFILE + '）' +
+        (plateinfoFrozen() ? ' · 已冻结' : '') +
+        (activePlatformAllowed() ? '' : ' · 已在前台停用，不执行任何自动化'));
+    // 诊断：本页 video 元素与 iframe 清单 —— 用于判断播放器是否在跨域 iframe 里
+    try {
+      const all = Array.from(document.querySelectorAll('video'));
+      const real = all.filter(isRealVideo).length;
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      const objects = Array.from(document.querySelectorAll('object, embed'));
+      const srcs = iframes.concat(objects).map(f => (f.src || f.data || '').slice(0, 120)).filter(Boolean);
+      const rootCnt = document.documentElement.getAttribute('data-ap-shadow-roots');
+      const sv = shadowRealVideos().length;
+      const bridgeOk = /^1@/.test(document.documentElement.getAttribute('data-ap-shadow-ok') || '');
+      // 自定义播放器（无 <video> 的 canvas / WebAudio 型，如百家云 bplayer）
+      let cpm = '';
+      try {
+        const cp = readCustomPlayer();
+        if (cp) cpm = ' | 自定义播放器: ' + cp.label + ' (' + fmtTime(cp.cur) + '/' + fmtTime(cp.dur) +
+                      (cp.playing ? ' 播放中' : ' 未播') + ')';
+      } catch (e) {}
+      log('诊断：本页 video 元素', all.length, '个（可播', real, '，空壳', all.length - real,
+          '）| iframe', iframes.length, '个 | object/embed', objects.length, '个',
+          srcs.length ? '→ ' + srcs.join(' | ').slice(0, 400) : '',
+          '| Shadow桥:', bridgeOk ? ('已安装(容器' + (rootCnt || '0') + ',video' + sv + ')') : '未安装',
+          cpm);
+    } catch (e) {}
     // 调试：输出全部课时的文本、类名、完成标记、链接，方便精准适配
     leaves.slice(0, 30).forEach((it, i) => {
       const cls = (typeof it.el.className === 'string') ? it.el.className.replace(/\s+/g, ' ').slice(0, 140) : '';
@@ -929,14 +2271,43 @@
       'button[title*="下一"]',
       '[aria-label*="下一集"]',
       '[title*="下一集"]',
-      '[class*="next-lesson" i]', '[class*="next-chapter" i]',
-      '[class*="next" i]'
+      '[class*="next-lesson" i]', '[class*="next-chapter" i]'
     ];
     for (const s of sels) {
       const el = queryVisible(s);
       if (el) return el;
     }
-    return null;
+
+    // 中文平台：按可见文本查找「下一节 / 下一讲 / 下一集 / 下一个」按钮
+    const byText = findNextButtonByText();
+    if (byText) return byText;
+
+    // 最后才用宽泛的 next 类名兜底
+    const loose = queryVisible('[class*="next" i]');
+    return loose;
+  }
+
+  // 按中文可见文本查找"下一节/下一讲/下一集/下节课"按钮
+  function findNextButtonByText() {
+    const RE = /下一[节讲章集个步课]?|下[一节讲集]|下节课|继续下一|播放下一/;
+    const EXCLUDE = /下一页|下一批|下一组|下一步\s*说明/;
+    const sel = 'button, a[href], [role="button"], [class*="btn" i], [class*="button" i]';
+    let fallback = null;
+    try {
+      document.querySelectorAll(sel).forEach(el => {
+        if (fallback) return;
+        // 关键：跳过本扩展自己的面板按钮（否则会命中面板上的"▶ 立即播放下一集"，点了等于没点）
+        if (isOwnEl(el)) return;
+        const t = (getAllText(el) || '').trim();
+        if (!t || t.length > 12) return;
+        if (EXCLUDE.test(t)) return;
+        if (!RE.test(t)) return;
+        if (!isVisible(el)) return;
+        fallback = el;
+      });
+    } catch (e) {}
+    if (fallback) log('按文本命中下一集按钮：', getAllText(fallback).slice(0, 20));
+    return fallback;
   }
 
   function getClickableTarget(el) {
@@ -945,6 +2316,13 @@
     a = el.closest('a');
     if (a) return a;
     if (el.tagName === 'A') return el;
+    // Vue / React 平台（如 jxnu zjpt）通常把点击事件绑在目录项的"内层容器"上
+    // （例：li > div.course-detail），点外层 li 不会触发内层处理器；
+    // 而点内层元素时事件会向上冒泡，两种绑定方式都能命中，因此优先点内层。
+    try {
+      const inner = el.querySelector('[class*="detail" i], [class*="title" i], [class*="name" i]');
+      if (inner && isVisible(inner)) return inner;
+    } catch (e) {}
     return el;
   }
 
@@ -1012,33 +2390,48 @@
 
     analyzeList();
 
-    // 本帧必须含有真实视频课时（网梯平台的 .s_point[itemtype="video"]）
-    // 内容帧（如播放器控件）即便识别出几项 leafCount 也不算数，必须让顶层调度到目录帧
-    let hasRealCatalog = false;
-    for (const it of localList.leaves) {
-      try { if (it.el.matches && it.el.matches('.s_point[itemtype="video"]')) { hasRealCatalog = true; break; } } catch (e) {}
-    }
-    if (!hasRealCatalog) {
-      log('本帧无真实视频课时目录（leafCount=', localList.leafCount, '），交由顶层调度');
+    // 本帧必须含有真实课程目录（网梯平台用专属标记，其他平台走通用判断）。
+    // 播放器帧即便识别出几项 leafCount 也不算数，必须让顶层调度到真正的目录帧。
+    if (!hasRealCatalogInList(localList)) {
+      log('本帧无真实课程目录（leafCount=', localList.leafCount, '），交由顶层调度');
       return false;
     }
 
-    const btn = findNextButton();
-    if (btn) {
-      log('点击下一集按钮');
-      btn.click();
-      lastClickAt = Date.now();
-      return true;
-    }
-
+    // 目录优先：目录能精确定位"下一个课时"，顺序可控。
+    // 平台自带的"下一集"按钮只在目录不可用时兜底（按钮无法保证顺序，历史上有乱跳问题）。
     const next = findNextItem(!!autoEnded);
     if (next) {
       log('点击下一节课：', next.text.slice(0, 40));
       lastClickAt = Date.now();
+      // 本地记账：仅自动连播（当前视频已播完）时把当前课时视为已完成，
+      // 手动跳转不算，平台完成状态延迟也不影响下一轮自动推进
+      try {
+        if (autoEnded && localList.current && localList.current.el && localList.current.el !== next.el) {
+          markLocalDone(localList.current.el);
+        }
+      } catch (e) {}
+      const beforeText = localList.current ? localList.current.text.slice(0, 40) : '';
       smartClick(next.el, (ok) => {
         if (ok) log('跳转成功');
         else log('跳转可能失败，元素不可见');
+        // 校验：2 秒后复查当前项是否真的切换了（Vue 平台点击不生效时能立刻发现）
+        setTimeout(() => {
+          try {
+            analyzeList();
+            const after = localList.current ? localList.current.text.slice(0, 40) : '(无)';
+            log('跳转校验：' + (after !== beforeText ? '已切换' : '⚠️ 当前项未变化'), '→', after);
+          } catch (e) {}
+        }, 2000);
       });
+      return true;
+    }
+
+    // 目录不可用时，才退回平台自带的"下一集"按钮
+    const btn = findNextButton();
+    if (btn) {
+      log('目录不可用，改用页面下一集按钮');
+      btn.click();
+      lastClickAt = Date.now();
       return true;
     }
 
@@ -1054,6 +2447,9 @@
 
     panel = document.createElement('div');
     panel.id = 'autoplayer-panel';
+    // 标记为"本扩展自有元素"：页面级扫描（找下一集按钮/播放按钮/目录）一律跳过，
+    // 否则扩展会把自己面板上的按钮当成平台按钮去点。
+    panel.setAttribute('data-ap-own', '1');
     panel.innerHTML =
       '<div class="ap-head">' +
         '<span class="ap-title">▶ 自动连播助手</span>' +
@@ -1061,6 +2457,9 @@
         '<button class="ap-min" id="ap-min" title="折叠/展开">—</button>' +
       '</div>' +
       '<div class="ap-body" id="ap-body">' +
+        '<label class="ap-row" title="刷新页面或跳到下一集后，自动替你点下第一次播放；之后你手动暂停就不再插手"><span>进入页面自动起播</span><input type="checkbox" id="ap-start"></label>' +
+        '<div class="ap-plat-title">平台启停<span class="ap-plat-now" id="ap-plat-now"></span></div>' +
+        '<div class="ap-plat-list" id="ap-platlist"></div>' +
         '<label class="ap-row" title="部分平台可能检测到非自然播放行为并弹出警告"><span>暂停自动续播 ⚠️</span><input type="checkbox" id="ap-resume"></label>' +
         '<label class="ap-row"><span>播完自动下一集</span><input type="checkbox" id="ap-next"></label>' +
         '<label class="ap-row"><span>倍速播放</span><input type="checkbox" id="ap-speed"></label>' +
@@ -1088,9 +2487,13 @@
         '<button class="ap-btn ap-btn-ghost" id="ap-copyhtml">📋 复制目录HTML</button>' +
         '<div class="ap-debug-toggle" id="ap-debug-toggle">显示调试日志 ▼</div>' +
         '<div class="ap-logs" id="ap-logs"></div>' +
+        '<div class="ap-copyright" title="本扩展为原创作品，著作权归 胡昱晨 (hu_yu_chen) 所有，禁止删除署名或冒称原创">' +
+          '© 2026 胡昱晨 (hu_yu_chen) · 原创作品 · MIT 授权' +
+        '</div>' +
       '</div>';
     document.body.appendChild(panel);
 
+    const startChk = panel.querySelector('#ap-start');
     const resumeChk = panel.querySelector('#ap-resume');
     const nextChk = panel.querySelector('#ap-next');
     const speedChk = panel.querySelector('#ap-speed');
@@ -1102,7 +2505,42 @@
     const logs = panel.querySelector('#ap-logs');
     const copyLogBtn = panel.querySelector('#ap-copylog');
     const copyHtmlBtn = panel.querySelector('#ap-copyhtml');
+    const platList = panel.querySelector('#ap-platlist');
+    const platNow = panel.querySelector('#ap-plat-now');
 
+    // 平台启停列表：与 PLATFORMS 一一对应，勾选状态实时写回 storage，
+    // 关闭当前页面所属平台后所有 tick 立即停手。
+    if (platList) {
+      PLATFORMS.forEach(p => {
+        const row = document.createElement('label');
+        row.className = 'ap-plat';
+        row.innerHTML =
+          '<input type="checkbox" data-plat="' + p.id + '"' + (platformEnabled(p.id) ? ' checked' : '') + '>' +
+          '<span class="ap-plat-main">' +
+            '<span class="ap-plat-name">' + p.name +
+              (p.frozen ? '<span class="ap-plat-frozen">已冻结</span>' : '') +
+            '</span>' +
+            '<span class="ap-plat-desc">' + p.desc + '</span>' +
+          '</span>';
+        const box = row.querySelector('input');
+        box.addEventListener('change', () => {
+          settings.platforms = settings.platforms || {};
+          settings.platforms[p.id] = box.checked;
+          saveSettings();
+          row.classList.toggle('ap-plat-off', !box.checked);
+          log('平台「' + p.name + '」已' + (box.checked ? '启用' : '停用') +
+              (box.checked ? '' : '：该平台所属页面上不再执行任何自动化'));
+          updateStatus();
+          if (!box.checked && ACTIVE_PROFILE === p.id) updateInfo();
+        });
+        row.classList.toggle('ap-plat-off', !platformEnabled(p.id));
+        platList.appendChild(row);
+      });
+    }
+    // 当前页面识别到的平台名（域名判定，一眼确认有没有走错分支）
+    if (platNow) platNow.textContent = '当前：' + platformInfo().name;
+
+    startChk.addEventListener('change', () => { settings.autoStart = startChk.checked; saveSettings(); updateStatus(); });
     resumeChk.addEventListener('change', () => { settings.autoResume = resumeChk.checked; saveSettings(); updateStatus(); });
     nextChk.addEventListener('change', () => { settings.autoNext = nextChk.checked; saveSettings(); updateStatus(); });
     speedChk.addEventListener('change', () => {
@@ -1143,15 +2581,61 @@
       catalogHtmlBuffer = '';
       pendingCatalogCopy = true;
       log('正在收集目录HTML…');
+      // 关键：顶层自己的目录也要放进缓冲区。此前只向子帧广播请求，
+      // 导致目录在顶层时缓冲区始终为空，"复制目录HTML"点了没反应。
+      try {
+        if (localList && localList.container) {
+          catalogHtmlBuffer += '<!-- TOP ' + location.href + ' -->\n' +
+            localList.container.outerHTML.slice(0, 6000) + '\n';
+        }
+      } catch (e) {}
+      // 附上 iframe 清单，便于判断播放器是否位于跨域 iframe
+      try {
+        const srcs = Array.from(document.querySelectorAll('iframe, object, embed'))
+          .map(f => (f.src || f.data || '').slice(0, 150)).filter(Boolean);
+        if (srcs.length) catalogHtmlBuffer += '<!-- IFRAMES -->\n' + srcs.join('\n') + '\n';
+      } catch (e) {}
+      // 附上播放器区域候选 DOM（控制条/画面容器），用于自定义播放器的精准适配
+      try {
+        const seen = new Set();
+        const cands = [];
+        document.querySelectorAll('[class*="player" i], [class*="video" i], [class*="bofang" i], .my-video')
+          .forEach(el => {
+            if (isOwnEl(el) || seen.has(el)) return;
+            if (localList.container && localList.container.contains(el)) return;
+            if (!isVisible(el)) return;
+            const r = el.getBoundingClientRect();
+            if (r.width < 250 || r.height < 120) return; // 只要画面级的大容器
+            // 只取最外层：已被已选候选包含的跳过
+            for (const c of cands) { if (c.contains(el)) return; }
+            for (let i = cands.length - 1; i >= 0; i--) { if (el.contains(cands[i])) cands.splice(i, 1); }
+            seen.add(el);
+            cands.push(el);
+          });
+        cands.slice(0, 3).forEach((el, i) => {
+          catalogHtmlBuffer += '\n<!-- PLAYER-REGION-' + i + ' <' + el.tagName.toLowerCase() +
+            ' class="' + (el.getAttribute('class') || '') + '"> -->\n' +
+            el.outerHTML.slice(0, 9000) + '\n';
+        });
+        if (cands.length) log('已收集播放器区域候选', cands.length, '个（随目录HTML一并复制）');
+      } catch (e) {}
+      // 明确附上"已识别的自定义播放器"DOM（不受上面的尺寸筛选限制）
+      try {
+        const cp = readCustomPlayer();
+        if (cp && cp.root) {
+          catalogHtmlBuffer += '\n<!-- CUSTOM-PLAYER <' + cp.root.tagName.toLowerCase() +
+            ' class="' + (cp.root.getAttribute('class') || '') + '"> -->\n' +
+            cp.root.outerHTML.slice(0, 12000) + '\n';
+        }
+      } catch (e) {}
       broadcastDown({ type: 'dumpCatalog' });
       setTimeout(() => {
-        if (pendingCatalogCopy && catalogHtmlBuffer) {
-          pendingCatalogCopy = false;
+        pendingCatalogCopy = false;
+        if (catalogHtmlBuffer) {
           const ok = copyText(catalogHtmlBuffer);
-          log(ok ? '目录HTML已复制（长度 ' + catalogHtmlBuffer.length + '）' : '复制失败');
-        } else if (pendingCatalogCopy) {
-          pendingCatalogCopy = false;
-          log('未收到目录HTML（可能目录在顶层或未识别）');
+          log(ok ? '目录HTML已复制（长度 ' + catalogHtmlBuffer.length + '）' : '复制失败，请手动选中日志复制');
+        } else {
+          log('未收到目录HTML：本页未识别到目录容器');
         }
       }, 1200);
     });
@@ -1167,9 +2651,21 @@
 
   function updateUI() {
     if (!panel) return;
+    const startChk = panel.querySelector('#ap-start'); if (startChk) startChk.checked = settings.autoStart !== false;
     panel.querySelector('#ap-resume').checked = !!settings.autoResume;
     panel.querySelector('#ap-next').checked = !!settings.autoNext;
     panel.querySelector('#ap-speed').checked = !!settings.speedEnabled;
+    // 面板内的平台勾选框同步一次（popup 里改过之后这里要跟上）
+    try {
+      panel.querySelectorAll('.ap-plat').forEach(row => {
+        const box = row.querySelector('input[data-plat]');
+        if (!box) return;
+        box.checked = platformEnabled(box.getAttribute('data-plat'));
+        row.classList.toggle('ap-plat-off', !box.checked);
+      });
+      const pn = panel.querySelector('#ap-plat-now');
+      if (pn) pn.textContent = '当前：' + platformInfo().name;
+    } catch (e) {}
     const sv = panel.querySelector('#ap-speed-val');
     if (sv) sv.value = String(currentRate());
     updateStatus();
@@ -1179,38 +2675,94 @@
   function updateStatus() {
     if (!panel) return;
     const st = panel.querySelector('#ap-status');
-    const running = settings.enabled && (settings.autoResume || settings.autoNext || settings.speedEnabled);
+    // 当前页面所属平台被停用 —— 优先级高于其它开关状态
+    if (!activePlatformAllowed()) {
+      st.textContent = '本平台已停用';
+      st.classList.add('ap-off');
+      return;
+    }
+    const running = settings.enabled && (settings.autoStart !== false || settings.autoResume || settings.autoNext || settings.speedEnabled);
     st.textContent = running ? '运行中' : '已暂停';
     st.classList.toggle('ap-off', !running);
   }
 
-  function getAggregatedVideos() {
+  // includeShell=true 时返回全部（含空壳），默认只返回真实可播的视频。
+  // 调用方（面板统计 / 卡结尾检测 / 目录进度兜底的开关）都只关心真实视频。
+  function getAggregatedVideos(includeShell) {
     const now = Date.now();
-    return Object.values(frameStates)
+    const arr = Object.values(frameStates)
       .filter(entry => now - entry.ts < 10000)
       .reduce((a, b) => a.concat(b.videos || []), []);
+    if (includeShell) return arr;
+    return arr.filter(isRealVideoObj);
   }
 
   function pickBestList() {
     const now = Date.now();
-    const states = Object.values(frameStates).filter(e => now - e.ts < 12000);
+    const states = Object.values(frameStates).filter(e => now - e.ts < frameStateMaxAge());
     if (!states.length) return null;
     const withCurrent = states.filter(e => e.list && e.list.current);
     if (withCurrent.length) return withCurrent.sort((a, b) => b.list.leafCount - a.list.leafCount)[0].list;
     return states.sort((a, b) => (b.list && b.list.leafCount || 0) - (a.list && a.list.leafCount || 0))[0].list;
   }
 
+  // 播放器容器选择器：位于其中的元素一律不视为课时目录项
+  const PLAYER_CONTAINER_SELECTOR =
+    'video, audio, canvas, .player, .jwplayer, .video-player, .vjs-control-bar, .bpx-player-container, ' +
+    '[class*="jwplayer" i], [class*="player-wrap" i], [class*="video-player" i], [class*="player-container" i], ' +
+    '[class*="bplayer" i]';
+
+  // 判断一个元素是否只是播放器控件（而非课程目录项）
+  function isPlayerControl(el) {
+    if (!el || !el.closest) return false;
+    try { return !!el.closest(PLAYER_CONTAINER_SELECTOR); } catch (e) { return false; }
+  }
+
+  // 判断某帧的目录是否为"真实课程目录"。
+  // 网梯/whaty 平台有专属标记；其余平台走通用判断，避免写死导致新平台失效。
   function hasRealCatalogInList(list) {
     const leaves = (list && list.leaves) || [];
+    if (!leaves.length) return false;
+
+    // 网梯/whaty-learnspace：真实视频课时节点
     for (const it of leaves) {
-      try { if (it.el && it.el.matches && it.el.matches('.s_point[itemtype="video"]')) return true; } catch (e) {}
+      try {
+        if (it.el && it.el.matches && it.el.matches('.s_point[itemtype="video"], [itemtype="video"]')) return true;
+      } catch (e) {}
     }
-    return false;
+
+    if (leaves.length < 2) return false;
+
+    // 通用平台：统计"像课时"的项（不在播放器容器内、标题有一定长度）
+    let valid = 0;
+    for (const it of leaves) {
+      if (!it.el) continue;
+      if (isPlayerControl(it.el)) continue;
+      const t = (it.text || '').trim();
+      if (t.length >= 3) valid++;
+    }
+    return valid >= Math.max(2, Math.ceil(leaves.length * 0.6));
+  }
+
+  // ------------------------------------------------------------------
+  // 后台/最小化抗节流
+  // 浏览器窗口最小化或标签页转入后台时，Chrome 会节流页面定时器（隐藏一段时间后
+  // setInterval 被压缩到每分钟才跑一次），导致状态上报停滞、frameStates 全部过期，
+  // 进而 pickBestFrameForNext 选不出目录帧、下一集不跳转。
+  // 对策：页面不可见时大幅放宽时效判定，目录结构本身不会因后台而改变。
+  // ------------------------------------------------------------------
+  function isDocHidden() {
+    try { return document.hidden === true || document.visibilityState === 'hidden'; } catch (e) { return false; }
+  }
+
+  function frameStateMaxAge() {
+    return isDocHidden() ? 300000 : 15000;   // 后台 5 分钟 / 前台 15 秒
   }
 
   function pickBestFrameForNext() {
     const now = Date.now();
-    const states = Object.values(frameStates).filter(e => now - e.ts < 12000 && e.list && e.list.leafCount >= 3 && hasRealCatalogInList(e.list));
+    const maxAge = frameStateMaxAge();
+    const states = Object.values(frameStates).filter(e => now - e.ts < maxAge && e.list && e.list.leafCount >= 3 && hasRealCatalogInList(e.list));
     if (IS_TOP && localList.leafCount >= 3 && hasRealCatalogInList(localList)) {
       states.push({ frameTag: getFrameTag(), frameUrl: location.href, list: localList, ts: Date.now() });
     }
@@ -1219,6 +2771,36 @@
     const best = states[0];
     if (best.frameTag === getFrameTag() && IS_TOP) return { isTop: true, frameTag: best.frameTag };
     return { isTop: false, frameTag: best.frameTag, frameUrl: best.frameUrl };
+  }
+
+  // 统一的"下一集"调度入口：视频结束、后台看门狗补跳都走这里
+  function dispatchNext(reason, allowRetry) {
+    if (!settings.enabled || !settings.autoNext) return false;
+    if (Date.now() - lastGlobalNextAt < 8000) return false;
+
+    // 刷新自身并唤醒子帧重新上报：
+    // postMessage 投递不受后台定时器节流影响，可在后台即时拉到最新目录状态
+    analyzeAndReport();
+    broadcastDown({ type: 'ping' });
+
+    lastGlobalNextAt = Date.now();
+    const best = pickBestFrameForNext();
+    if (!best) {
+      log(reason, '暂未找到有效目录帧' + (allowRetry ? '，稍后重试' : '，放弃本次跳转'));
+      // 子帧的上报可能晚于本次判断（尤其后台节流时），安排一次重试
+      if (allowRetry) {
+        lastGlobalNextAt = 0;
+        setTimeout(() => dispatchNext(reason + '（重试）', false), 900);
+      }
+      return false;
+    }
+    if (best.isTop) {
+      log(reason, '顶层执行下一集');
+      return clickNext(true, true);
+    }
+    log(reason, '委派下一集到', best.frameTag);
+    broadcastDown({ type: 'clickNext', bestFrameTag: best.frameTag, manual: false });
+    return true;
   }
 
   function updateInfo() {
@@ -1230,12 +2812,36 @@
     const progressFill = panel.querySelector('#ap-progress-fill');
 
     const agg = getAggregatedVideos();
-    const activeVideo = agg.find(v => v.duration > 0 && !v.paused && !v.ended) ||
-                        agg.find(v => v.duration > 0) || agg[0] || null;
+    // 去重统计：部分平台页面里存在多个重复 src 的 video 元素（清晰度切换预置等），
+    // 按 src 去重后更接近用户感知的"视频数"
+    const seenSrc = new Set();
+    let videoCount = 0;
+    agg.forEach(v => {
+      const s = (v.src || '').split('#')[0];
+      if (s) { if (!seenSrc.has(s)) { seenSrc.add(s); videoCount++; } }
+      else videoCount++;
+    });
+    // 活动视频：优先"正在播放"的那个；部分平台自定义播放器 duration 为 0/未知，
+    // 不能因 duration 无效就选不到正在播的视频（否则进度永远显示 0%）
+    const activeVideo =
+      agg.find(v => !v.paused && !v.ended && (v.duration > 0 || v.currentTime > 0)) ||
+      agg.find(v => v.duration > 0 && v.currentTime > 0) ||
+      agg.find(v => v.duration > 0) || agg[0] || null;
 
     if (activeVideo && isFinite(activeVideo.duration) && activeVideo.duration > 0) {
       const pct = Math.min(100, Math.max(0, (activeVideo.currentTime / activeVideo.duration) * 100));
       progressText.textContent = `当前 ${fmtTime(activeVideo.currentTime)} / ${fmtTime(activeVideo.duration)}`;
+      progressPct.textContent = pct.toFixed(0) + '%';
+      progressFill.style.width = pct + '%';
+    } else if (activeVideo && activeVideo.currentTime > 0) {
+      // 时长未知但确有播放位置：显示已播时间，百分比暂不可知
+      progressText.textContent = `当前 ${fmtTime(activeVideo.currentTime)} / 未知时长`;
+      progressPct.textContent = '--%';
+      progressFill.style.width = '0%';
+    } else if (localList && localList.current && localList.currentPct >= 0) {
+      // 监听不到 video（跨域播放器 iframe）时，用平台目录上的课时进度百分比兜底显示
+      const pct = Math.min(100, Math.max(0, localList.currentPct));
+      progressText.textContent = `课时进度 ${pct.toFixed(1)}%（播放器跨域，无法读取播放位置）`;
       progressPct.textContent = pct.toFixed(0) + '%';
       progressFill.style.width = pct + '%';
     } else {
@@ -1259,7 +2865,16 @@
     }
 
     const frameCount = Object.keys(frameStates).length;
-    info.textContent = `检测到 ${agg.length} 个视频（${frameCount} 帧） · 目录 ${total} 项`;
+    const shellCount = getAggregatedVideos(true).length - videoCount;
+    const hasCustomPlayer = agg.some(v => v.from === 'custom');
+    let noVideoHint = '';
+    if (hasCustomPlayer) {
+      noVideoHint = ' · 已接管画布型播放器（本页无 <video>）';
+    } else if (videoCount === 0 && total > 0) {
+      noVideoHint = ' · 播放器不可直接控制，按目录进度驱动';
+      if (shellCount > 0) noVideoHint += `（页面 ${shellCount} 个空壳 video 已忽略）`;
+    }
+    info.textContent = `检测到 ${videoCount} 个视频（${frameCount} 帧） · 目录 ${total} 项${noVideoHint}`;
 
     updateLogs();
   }
@@ -1360,23 +2975,146 @@
     }
 
     if (d.type === 'ended' && IS_TOP) {
-      if (!d.handled && settings.enabled && settings.autoNext) {
-        if (Date.now() - lastGlobalNextAt < 8000) return;
-        lastGlobalNextAt = Date.now();
-        const best = pickBestFrameForNext();
-        if (best) {
-          if (best.isTop) {
-            log('顶层执行下一集');
-            clickNext(true, true);
-          } else {
-            log('委派下一集到', best.frameTag);
-            broadcastDown({ type: 'clickNext', bestFrameTag: best.frameTag, manual: false });
-          }
-        } else {
-          log('未找到有效目录帧，无法自动下一集');
+      if (!d.handled) dispatchNext('视频结束：', true);
+    }
+  });
+
+  // ---------- SPA 路由变化监听 ----------
+  // 现代学习平台（Vue/React，如江西师范大学 zjpt）切换视频时不刷新页面，
+  // content script 不会被重新执行，必须主动感知 URL 变化后重新扫描视频与目录。
+  function watchSpaRoute() {
+    let lastUrl = location.href;
+    const onChange = () => {
+      let now;
+      try { now = location.href; } catch (e) { return; }
+      if (!now || now === lastUrl) return;
+      lastUrl = now;
+      log('检测到路由变化，重新分析：', now.slice(0, 120));
+      // 重置上一轮跳转状态，避免旧锁与旧视频残留影响新一轮
+      lastClickAt = 0;
+      handlingEnd = false;
+      lastEndedVideo = null;
+      // 切换课时后播放器会重建：重置自定义播放器的位置追踪，给它一个全新的判停窗口
+      customPrev.key = '';
+      customPrev.cur = -1;
+      customPrev.at = Date.now();
+      // 重开冷启动窗口：新课时必须重新走一次"首次自动起播"，否则会一直停在暂停态
+      customBootAt = Date.now();
+      customBootBase = -1;
+      customBooted = false;
+      customBootTries = 0;
+      customIgnoreUntil = 0;
+      customJumpSeen = 0;
+      lastPagePlayAt = 0;
+      customTry.idx = 0;
+      const redo = () => {
+        scanVideos();
+        try { analyzeList(); } catch (e) { log('analyzeList error', e.message); }
+        reportVideoState();
+        if (IS_TOP && panel) updateInfo();
+      };
+      setTimeout(redo, 800);
+      setTimeout(redo, 2500);
+    };
+
+    window.addEventListener('popstate', onChange);
+    window.addEventListener('hashchange', onChange);
+
+    // 劫持 pushState / replaceState：SPA 路由常用，且不触发原生事件
+    try {
+      const wrap = (name) => {
+        const orig = history[name];
+        if (typeof orig !== 'function') return;
+        history[name] = function () {
+          const r = orig.apply(this, arguments);
+          try { onChange(); } catch (e) {}
+          return r;
+        };
+      };
+      wrap('pushState');
+      wrap('replaceState');
+    } catch (e) {}
+
+    // 兜底轮询：部分框架直接改地址栏，不走 history API
+    setInterval(onChange, 1500);
+  }
+
+  // ---------- 后台保活：看门狗 ----------
+  // 窗口最小化 / 标签页转入后台后，Chrome 会节流页面定时器（setInterval 被压缩为每分钟
+  // 甚至更低频率），目录扫描、状态上报、"下一集"调度随之停摆 —— 这正是"最小化后不播也不跳"的原因。
+  // 对策：background service worker 用 chrome.alarms 每分钟触发一次，再通过 chrome.tabs.sendMessage
+  // 唤醒本页面。消息投递会立即执行页面脚本，不受定时器节流限制。
+  let watchdogRegistered = false;
+  function registerWatchdog() {
+    try {
+      if (!chrome.runtime || !chrome.runtime.id) return;
+      const ping = () => {
+        try {
+          chrome.runtime.sendMessage({ type: 'apRegister' }, () => { void chrome.runtime.lastError; });
+        } catch (e) {}
+      };
+      if (watchdogRegistered) return;
+      watchdogRegistered = true;
+      ping();
+      // 周期性重注册，顺带唤醒 service worker；只要注册成功一次，闹钟就会持续生效
+      setInterval(ping, 45000);
+    } catch (e) {}
+  }
+
+  // 是否存在"已经播完 / 卡在结尾却没有跳转"的视频
+  function hasStuckEndedVideo() {
+    try {
+      const agg = IS_TOP ? getAggregatedVideos() : getLocalVideoState();
+      if (!agg.length) return false;
+      return agg.some(v =>
+        v && isFinite(v.duration) && v.duration > 0 &&
+        (v.ended || (!v.paused && v.duration - v.currentTime <= 2))
+      );
+    } catch (e) { return false; }
+  }
+
+  // 看门狗心跳：刷新状态 -> 保播 -> 必要时补跳下一集
+  function watchdogTick() {
+    try {
+      scanVideos();
+      analyzeAndReport();
+      ensurePlaying();
+      try { customPlayerTick(); } catch (e) {}
+      try { broadcastDown({ type: 'ping' }); } catch (e) {}
+      checkShadowVideos();
+      if (IS_TOP) {
+        if (panel) updateInfo();
+        if (settings.enabled && settings.autoNext && hasStuckEndedVideo()) {
+          dispatchNext('后台看门狗：', true);
         }
       }
-    }
+    } catch (e) {}
+  }
+
+  try {
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      if (msg && msg.type === 'apWatchdog') {
+        watchdogTick();
+        if (sendResponse) sendResponse({ ok: true });
+        return true;
+      }
+      return false;
+    });
+  } catch (e) {}
+
+  // 页面从后台恢复可见时，立即补齐后台节流期间遗漏的动作
+  document.addEventListener('visibilitychange', () => {
+    if (isDocHidden()) return;
+    setTimeout(() => {
+      try {
+        scanVideos();
+        analyzeAndReport();
+        ensurePlaying();
+        if (IS_TOP && settings.enabled && settings.autoNext && hasStuckEndedVideo()) {
+          dispatchNext('恢复可见：', true);
+        }
+      } catch (e) {}
+    }, 300);
   });
 
   // ---------- 初始化 ----------
@@ -1389,34 +3127,60 @@
 
   function init() {
     loadSettings(() => {
+      // 平台判定必须在所有扫描之前完成：后续所有平台专属分支都以它为准
+      refreshProfile();
+      if (shouldEarlyExit()) {
+        if (!activePlatformAllowed()) {
+          log('平台「' + platformInfo().name + '」已在前台关闭，本页不启用任何自动化');
+        } else {
+          log('非视频页面，跳过初始化');
+        }
+        return;
+      }
+      log('当前平台：' + platformInfo().name + '（' + ACTIVE_PROFILE + '）· ' + platformInfo().desc);
       observe();
+      watchSpaRoute();
+      registerWatchdog();
       if (IS_TOP) {
         ensureUI();
         if (infoTimer) clearInterval(infoTimer);
         infoTimer = setInterval(() => {
-          analyzeAndReport();
-          if (panel) updateInfo();
+          try {
+            analyzeAndReport();
+            ensurePlaying();
+            customPlayerTick();
+            checkShadowVideos();
+            catalogDrivenTick();
+            if (panel) updateInfo();
+          } catch (e) { log('tick error', (e && e.message) || e); }
           // 定时 ping 子帧，防止 iframe 加载晚于 content script（降低频率减少开销与风险）
-          broadcastDown({ type: 'ping' });
+          try { broadcastDown({ type: 'ping' }); } catch (e) {}
         }, 3000);
         setInterval(scanVideos, 2000);
+        // 心跳集中 try 包裹：任何一个环节抛错都不能拖垮整条连播链路
+        setInterval(() => { try { customPlayerTick(); } catch (e) {} }, 2000);
         setInterval(() => {
           const now = Date.now();
+          const maxAge = frameStateMaxAge();
           for (const k of Object.keys(frameStates)) {
-            if (now - frameStates[k].ts > 15000) delete frameStates[k];
+            if (now - frameStates[k].ts > maxAge) delete frameStates[k];
           }
         }, 5000);
         log('顶层初始化完成', location.href);
       } else {
         setInterval(() => { analyzeAndReport(); }, 1500);
+        setInterval(() => { try { customPlayerTick(); } catch (e) {} }, 2000);
         setInterval(scanVideos, 2000);
-        log('子帧初始化完成', location.href);
+        log('子帧初始化完成', location.href, '| 已知平台:', isKnownHost(), '| video元素:', hasVideoElement());
       }
     });
   }
 
   // 等待 document 和 iframe 内部资源尽量就绪后再开始
   function runInit() {
+    // 尽早注入 Shadow DOM 桥：必须抢在播放器库创建 closed shadowRoot 之前，
+    // 否则 attachShadow 钩子截获不到引用（document_start 运行正是为此）
+    injectShadowBridge();
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
         setTimeout(init, 300);
@@ -1429,6 +3193,15 @@
       setTimeout(() => {
         scanVideos();
         analyzeAndReport();
+        // 诊断：输出页面全部 iframe 地址，便于判断播放器是否位于跨域 iframe
+        if (IS_TOP) {
+          try {
+            const srcs = Array.from(document.querySelectorAll('iframe'))
+              .map(f => (f.src || f.getAttribute('data-src') || '').slice(0, 120))
+              .filter(Boolean);
+            if (srcs.length) log('页面iframe(' + srcs.length + '):', srcs.join(' | ').slice(0, 600));
+          } catch (e) {}
+        }
       }, 1000);
     });
   }
