@@ -75,11 +75,59 @@
       padding: 0 4px;
       margin-left: 6px;
     }
+    /* 授权卡：未授权时置顶显示，一眼能看到 */
+    .lic {
+      border: 1px solid #f0c36d;
+      background: #fffaf0;
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    .lic.ok { border-color: #7ee2a8; background: #f0fbf5; }
+    .lic-status { font-size: 12px; font-weight: 600; margin-bottom: 8px; word-break: break-all; line-height: 1.5; }
+    .lic-row { display: flex; gap: 6px; }
+    .lic-row input {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .lic-btn {
+      width: auto;
+      margin-top: 0;
+      padding: 6px 12px;
+      font-size: 12px;
+      flex: 0 0 auto;
+    }
+    .lic-meta { font-size: 11px; color: #888; margin-top: 8px; line-height: 1.6; word-break: break-all; }
+    .lic-meta b { color: #555; }
+    .lic-clear {
+      background: none;
+      border: none;
+      color: #c0392b;
+      font-size: 11px;
+      padding: 0;
+      margin-top: 6px;
+      width: auto;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    .lic-clear:hover { background: none; color: #96281b; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>▶ 自动连播助手</h1>
+    <div class="lic" id="licBox">
+      <div class="lic-status" id="licStatus">授权检测中…</div>
+      <div class="lic-row">
+        <input type="text" id="licInput" placeholder="输入授权码（可粘贴带连字符的）" spellcheck="false">
+        <button class="lic-btn" id="licActivate">激活</button>
+      </div>
+      <div class="lic-meta" id="licMeta"></div>
+    </div>
     <div class="row"><span>总开关</span><input type="checkbox" id="enabled"></div>
     <div class="plat-title">平台启停</div>
     <div class="plat-list" id="platList"></div>
@@ -107,6 +155,7 @@
       禁止删除作者署名或冒称原创
     </div>
   </div>
+  <script src="license.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
