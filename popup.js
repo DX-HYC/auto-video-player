@@ -43,13 +43,91 @@ const CHECK_KEYS = ['enabled', 'autoStart', 'autoResume', 'autoNext', 'speedEnab
 
 const platState = {};
 
+// ---------- 授权 ----------
+// 与 content.js 共用 license.js。v2.1.1 起授权为程序级（不绑定域名/平台），
+// popup 里的校验即最终校验：签名 + 有效期 + 客户号，通过后全部功能可用。
+const licBox = document.getElementById('licBox');
+const licStatus = document.getElementById('licStatus');
+const licInput = document.getElementById('licInput');
+const licMeta = document.getElementById('licMeta');
+
+function renderLicense(state, rawKey) {
+  const author = (typeof APLicense !== 'undefined' && APLicense.AUTHOR) ? APLicense.AUTHOR : { name: '', contact: '' };
+  if (state && state.ok) {
+    licBox.classList.add('ok');
+    licStatus.textContent = '✅ ' + state.msg;
+    const p = state.payload || {};
+    let detail = '授权信息：';
+    if (p.c) detail += '客户 ' + p.c + ' · ';
+    detail += '程序级授权（全部功能 · 全部已支持网站） · ';
+    detail += (p.x ? '到期 ' + APLicense.fmtDate(p.x) : '永久有效');
+    licMeta.innerHTML = escapeHtml(detail) +
+      '<br>更换设备/浏览器时，用同一授权码再次激活即可（设置随 chrome 账号同步）。' +
+      '<br><button class="lic-clear" id="licClear">清除本机授权</button>';
+    const clear = document.getElementById('licClear');
+    if (clear) clear.addEventListener('click', () => {
+      chrome.storage.sync.set({ licenseKey: '' }, () => {
+        licInput.value = '';
+        loadLicense();
+      });
+    });
+  } else {
+    licBox.classList.remove('ok');
+    const reason = (typeof APLicense !== 'undefined' && APLicense.reasonText) ? APLicense.reasonText(state) : '未授权';
+    licStatus.textContent = '🔒 ' + reason;
+    licMeta.innerHTML = '未授权时插件<strong>不会工作</strong>：不会自动播放、不会自动下一集。' +
+      '<br>请联系作者购买授权并获取授权码：<b>' + escapeHtml(author.name || '') +
+      (author.contact ? ' · ' + escapeHtml(author.contact) : '') + '</b>' +
+      '<br>授权为程序级：不绑定网站，激活后全部功能可用；随 chrome 账号同步，换电脑登录同一账号即可。';
+  }
+  if (rawKey && !state.ok) licInput.value = rawKey;
+}
+
+function loadLicense() {
+  chrome.storage.sync.get({ licenseKey: '' }, (s) => {
+    const raw = (s && typeof s.licenseKey === 'string') ? s.licenseKey : '';
+    const st = (typeof APLicense !== 'undefined')
+      ? APLicense.verifyLicense(raw, '', Date.now())   // 程序级授权：不传域名
+      : { ok: false, msg: '授权模块加载失败' };
+    renderLicense(st, '');
+  });
+}
+
+document.getElementById('licActivate').addEventListener('click', () => {
+  const raw = licInput.value;
+  const st = (typeof APLicense !== 'undefined')
+    ? APLicense.verifyLicense(raw, '', Date.now())
+    : { ok: false, msg: '授权模块加载失败' };
+  if (!st.ok) { renderLicense(st, raw); return; }
+  chrome.storage.sync.set({ licenseKey: raw }, () => {
+    renderLicense(st, '');
+    licInput.value = '';
+  });
+});
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 chrome.storage.sync.get(DEFAULTS, (s) => {
   CHECK_KEYS.forEach((k) => {
     const el = document.getElementById(k);
     if (el) el.checked = !!s[k];
   });
   const rateEl = document.getElementById('playbackRate');
-  if (rateEl) rateEl.value = String(s.playbackRate || 1);
+  if (rateEl) {
+    const rv = String(s.playbackRate || 1);
+    // 存储了选项外的倍率时动态补选项，避免 select 显示空白
+    if (!Array.prototype.some.call(rateEl.options, o => o.value === rv)) {
+      const opt = document.createElement('option');
+      opt.value = rv;
+      opt.textContent = rv + 'x';
+      rateEl.appendChild(opt);
+    }
+    rateEl.value = rv;
+  }
 
   const saved = (s.platforms && typeof s.platforms === 'object') ? s.platforms : {};
   const list = document.getElementById('platList');
@@ -69,6 +147,7 @@ chrome.storage.sync.get(DEFAULTS, (s) => {
     box.addEventListener('change', () => { platState[p.id] = box.checked; });
     list.appendChild(label);
   });
+  loadLicense();
 });
 
 document.getElementById('apply').addEventListener('click', () => {
