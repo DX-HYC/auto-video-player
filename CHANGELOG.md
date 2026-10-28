@@ -1,5 +1,124 @@
 # 更新日志
 
+### v2.1.2（2026-10-27）全栈体检：5 个 bug 修复 + 性能优化
+
+对全部源码（manifest / background / content / popup / license / shadow_bridge，约 4900 行）
+做了一次完整通读，修复确认的问题：
+
+**Bug 修复**
+- `readCustomPlayer()` 调用了未定义的 `pick()`：「时长读不到」的分支一进去就抛
+  ReferenceError，被外层 try 静默吞掉 —— playing 判定与进度条兜底整段丢失，
+  自定义播放器会被永远当成"暂停中"（现有测试都走"时长读得到"的分支，从未覆盖）。
+- SPA 路由监听的重复注册：页面先待命再被播放内容唤醒时会再次调用 `watchSpaRoute()`，
+  导致 popstate/hashchange 监听器叠加、`history.pushState` 被反复包装、1500ms 轮询
+  interval 越积越多（且不在 tickTimers 里，待命时清不掉）。改为监听器只装一次 +
+  轮询纳入 tickTimers 统一管理。
+- background 标签页注册竞态：`addTab/removeTab` 原是"异步读 storage → 改 → 写回"，
+  两个标签页几乎同时注册时后写覆盖先写（丢更新），被丢的标签页再也收不到看门狗
+  唤醒。改为内存数组为单一事实源 + 启动时恢复一次（单 Promise 去重）。
+- Shadow 桥升级后不刷新 matches：扩展升级后若域名清单变了，已注册的 MAIN world
+  桥不会更新，新域名上永远注入不了。改为注册前逐项比对，过期则 updateContentScripts
+  （老内核自动降级为"注销 → 重注册"）。
+- 面板"空壳 video"统计错误：用"全部 - 按 src 去重后的真实视频数"相减，页面存在
+  重复 src 的 video 时会虚报空壳数量。改为直接按 isRealVideoObj 统计。
+
+**健壮性**
+- `chrome.tabs.sendMessage` 同时兼容 callback 与 Promise 两种 API 形态（此前直接
+  `.catch()`，在只支持 callback 的内核上会抛 TypeError 导致后续标签页全部漏 ping）。
+- 起播复查定时器（3s/8s/16s 三连）重新调度前先作废旧句柄，防止播放卡住时定时器堆积。
+- 待命唤醒后断开待命观察器，避免与主观察器重复触发同一批扫描。
+- Shadow 播放器的起播条件对齐 autoStart 开关（此前绕过开关只看 currentTime<15）。
+- ping 消息向孙辈 iframe 转发（嵌套 iframe 此前收不到顶层心跳）。
+- 面板/popup 的倍速下拉在存储值不在选项内时动态补选项，不再显示空白；
+  updateUI 对面板控件逐个空值保护。
+
+**性能**
+- video 元素清单缓存：`queryVideos()` 原先用 `querySelectorAll('*')` 遍历全文档每一个
+  元素找 shadow 宿主，被状态上报（1.5s）/保播（3s）/倍速等多条路径高频重复调用。
+  现在绑定路径永远全量刷新，读取路径走 1.5s TTL 缓存（新增元素由 MutationObserver
+  即时刷新），大页面 CPU 占用显著下降。
+- 目录容器查找缓存：`findCatalogContainer()` 每 1.5~3 秒跑三十多组全文档扫描 +
+  getBoundingClientRect 评分，加 1.2s TTL 缓存（document.contains 校验，SPA 换课时
+  旧容器 detached 立即重扫）。
+
+**测试**
+- 新增 `tests/selftest_robust.js`（44 项）：readCustomPlayer 真实行为测试（DOM 桩，
+  锁死 pick bug）、background 行为测试（chrome API 桩：竞态/桥刷新/消息双形态）、
+  17 项修复源码断言。全量回归 184/184 通过。
+
+### v2.1.1（2026-10-27）授权改为程序级：不绑定域名/平台
+
+起因：授权不应针对某个域名或平台——用户购买的是"这个程序的使用授权"，授权后应能使用全部功能。
+
+- `license.js`：授权码 payload 去掉域名字段，只保留版本 + 过期时间 + 客户号 + 备注；
+  校验不再进行域名匹配，**同一授权码在任何网站、任何平台都有效**；
+  旧版（v2.1.1 前）签发的带域名授权码签名仍然有效且同样不再受域名限制，无需重签。
+- 未授权提示卡：移除「当前网站域名 + 一键复制」行（程序级授权不再需要域名信息），
+  保留失败原因、作者联系方式、授权码输入框。
+- popup 授权卡：授权信息由「适用网站 xxx」改为「程序级授权（全部功能 · 全部已支持网站）」；
+  未授权引导语由"把网站域名发给作者"改为"联系作者购买授权"。
+- `tools/gen-license.js`：`--domain` 不再是必填（传入会被忽略并提示），
+  签发命令简化为 `node tools/gen-license.js --days 365 --customer CUST-001`，
+  转发话术同步改为"授权不绑定网站，激活后全部功能可用"。
+- 测试：`tests/selftest_license.js` 升级为 51 项，新增「任意域名均放行」「payload 不含
+  域名字段」「旧带域名码全站有效」「提示卡无域名行」等断言；全量回归 140/140 通过。
+
+### v2.1.0（2026-10-27）商业授权 + 修复"任何网页都蹦出插件"
+
+**一、商业授权（未授权不工作）**
+
+起因：准备商业化售卖，要求没有授权就无法使用插件，并提示用户联系作者授权。
+
+- 新增 `license.js`：离线授权码方案，**不需要服务器**。
+  - 授权码 = `AVP1` + base32(payload) + HMAC-SHA256 签名，payload 含绑定域名（可多个，含子域）、
+    过期时间（0=永久）、客户号、备注；
+  - SHA-256/HMAC 为同步实现，**不依赖 crypto.subtle**（http 网站没有该 API），
+    content script / popup / Node 生成器三方共用同一份代码，算法永不漂移；
+  - base32 用 Crockford 字符集（无 I/L/O/U），授权码可按 5 字符分组显示，用户粘贴时空格/
+    连字符/小写全部容错。
+- 未授权时的行为（硬性策略）：`checkLicense()` 不通过 → **不扫描、不起播、不建面板、
+  不注册看门狗**，只在页面右下角显示「🔒 插件未授权」卡片：失败原因、作者联系方式、
+  授权码输入框（回车/点激活即生效）、当前网站域名一键复制（发给作者签发用）。
+- 激活即生效：写入 `chrome.storage.sync.licenseKey`，已打开页面通过 storage.onChanged
+  收到变化立即启动，无需刷新；授权被清除/失效时 `recheckLicense()` 立即 `enterStandby()` 停手。
+- popup 顶部新增授权卡：状态（✅ 已授权/客户号/到期/适用网站 或 🔒 原因+联系方式）、
+  激活输入框、清除授权。popup 里 hostname 传空、跳过域名匹配（拿不到标签页域名），
+  域名终检由网页里的 content script 用真实 hostname 完成。
+- 新增 `tools/gen-license.js`（作者工具，**不随买家分发包**）：
+  `node tools/gen-license.js --domain zjpt-web.jxnu.edu.cn --days 365 --customer CUST-001`，
+  输出分组授权码 + 授权摘要 + 可直接转发的话术；生成后自动自检。支持 `--forever`、多域名、
+  自定义备注、`--secret` 轮换兼容。
+- 安全边界（如实）：密钥内置在 license.js，可挡普通用户、挡不住专业逆向；需要更强保护
+  应改服务器在线校验。轮换密钥 = 改 `SIGN_SECRET` 重新打包，旧码全部作废。
+- 新增 `tests/selftest_license.js`（48 项）：SHA-256 标准向量（FIPS 180-4）、base32 往返、
+  有效码/子域/容错/域名不匹配/篡改/错误密钥伪造/过期/永久/多域名/格式错误/popup 预检/
+  版本过旧/提示文案必含作者联系方式，以及 content.js 授权闸门与待命守卫的源码级断言。
+
+**二、修复"安装后任何网页都蹦出插件并运行"**
+
+排查结论：manifest 的 `content_scripts` 本来就是 27 域名白名单，问题在运行逻辑——
+`shouldEarlyExit()` 判定为"域名在白名单就不早退"，于是白名单站点里的普通页面
+（首页、空间页等没有任何视频的页面）也会建面板 + 3s 心跳；`all_frames:true` 还让
+任何嵌了白名单 iframe 的网页都在子帧里跑扫描。三层修复：
+
+1. **启动状态机**（content.js）：`boot()` 先探测播放内容特征（video / audio[src] /
+   画布播放器 / 目录容器 / 白名单 iframe / player·video 类名），
+   - 有特征 → `startFull()` 完整启动；
+   - 无特征 → `startProbe()` 只挂一个轻量 MutationObserver，**不建面板、不扫描**；
+   - 8 秒仍无特征 → `enterStandby()` 停掉全部定时器、看门狗、面板（待命观察器保留，
+     页面之后真的出现播放内容——SPA 路由、延迟加载——自动唤醒）。
+2. **待命守卫**：看门狗消息 / visibilitychange / window load / SPA 路由变化四个通道
+   在待命期全部直接返回，杜绝"后台被唤醒后复活扫描"。
+3. **权限收敛**：`host_permissions` 与 `web_accessible_resources` 从 `<all_urls>`
+   收紧为与 `content_scripts` 相同的 27 域名白名单。
+
+**三、其它**
+
+- `escapeHtml()` 补全引号转义（授权原因等不可信文本插入 DOM 前转义）。
+- 面板信息行追加授权状态（客户号/到期），激活与失效在调试日志可见。
+- manifest 版本 2.1.0；`SETTINGS_VERSION` 保持 2.0.0（设置 schema 未变）。
+- 网梯冻结区未动；`node tests/run-all.js` 全量 **137/137 通过**。
+
 ### v2.0.1（2026-10-13）平台名称更正
 
 纯文案修正，无逻辑改动。
