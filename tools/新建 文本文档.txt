@@ -1,0 +1,1 @@
+node tools/gen-license.js --days 365 --customer CUST-001
