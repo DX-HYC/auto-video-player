@@ -1,18 +1,74 @@
 {
   "manifest_version": 3,
   "name": "自动连播助手",
-  "version": "2.0.1",
+  "version": "2.1.2",
   "author": "胡昱晨 (hu_yu_chen)",
   "description": "© 2026 胡昱晨 (hu_yu_chen) 原创作品，保留所有权利｜自动识别网页视频与播放列表：暂停自动续播、播完自动下一集、支持倍速。MIT 授权，禁止删除署名或冒称原创。",
   "permissions": ["storage", "alarms", "scripting"],
   "background": {
     "service_worker": "background.js"
   },
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "*://*.webtrn.cn/*",
+    "*://*.jxnu.edu.cn/*",
+    "*://*.bilibili.com/*",
+    "*://*.youku.com/*",
+    "*://*.iqiyi.com/*",
+    "*://*.v.qq.com/*",
+    "*://*.study.163.com/*",
+    "*://*.icourse163.org/*",
+    "*://*.xuetangx.com/*",
+    "*://*.zhihuishu.com/*",
+    "*://*.imooc.com/*",
+    "*://*.chaoxing.com/*",
+    "*://*.open.163.com/*",
+    "*://*.ke.qq.com/*",
+    "*://*.gaodun.com/*",
+    "*://*.gaoxiaobang.com/*",
+    "*://*.duobei.com/*",
+    "*://*.xuexi.cn/*",
+    "*://*.docin.com/*",
+    "*://*.doc88.com/*",
+    "*://*.youtube.com/*",
+    "*://*.vimeo.com/*",
+    "*://*.twitch.tv/*",
+    "*://*.douyin.com/*",
+    "*://*.kuaishou.com/*",
+    "*://*.huya.com/*",
+    "*://*.douyu.com/*"
+  ],
   "web_accessible_resources": [
     {
       "resources": ["shadow_bridge.js"],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "*://*.webtrn.cn/*",
+        "*://*.jxnu.edu.cn/*",
+        "*://*.bilibili.com/*",
+        "*://*.youku.com/*",
+        "*://*.iqiyi.com/*",
+        "*://*.v.qq.com/*",
+        "*://*.study.163.com/*",
+        "*://*.icourse163.org/*",
+        "*://*.xuetangx.com/*",
+        "*://*.zhihuishu.com/*",
+        "*://*.imooc.com/*",
+        "*://*.chaoxing.com/*",
+        "*://*.open.163.com/*",
+        "*://*.ke.qq.com/*",
+        "*://*.gaodun.com/*",
+        "*://*.gaoxiaobang.com/*",
+        "*://*.duobei.com/*",
+        "*://*.xuexi.cn/*",
+        "*://*.docin.com/*",
+        "*://*.doc88.com/*",
+        "*://*.youtube.com/*",
+        "*://*.vimeo.com/*",
+        "*://*.twitch.tv/*",
+        "*://*.douyin.com/*",
+        "*://*.kuaishou.com/*",
+        "*://*.huya.com/*",
+        "*://*.douyu.com/*"
+      ]
     }
   ],
   "action": {
@@ -60,7 +116,7 @@
         "*://*.huya.com/*",
         "*://*.douyu.com/*"
       ],
-      "js": ["content.js"],
+      "js": ["license.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_start",
       "all_frames": true
