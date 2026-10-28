@@ -60,6 +60,33 @@
 - **平台启停**：可单独关闭某个平台。关闭后，该平台所属域名上扩展完全不动（不建面板、不扫描、不接管），适合在其中某个平台出问题时先隔离该平台、不影响其他平台。重新勾选即可恢复，无需刷新页面。
 - 设置通过 Chrome 同步存储，改动会实时生效到已打开的页面。
 - 若不希望某些页面自动运行，可在扩展详情里通过「网站访问权限」限制。
+- **只在有播放内容的页面工作**：打开白名单内的普通页面（首页、列表页等没有任何视频/播放器特征的网页）时，扩展不会弹出面板、不做任何扫描；页面后续真的出现播放内容才会自动启动。
+
+## 商业授权（作者必读）
+
+本插件采用**离线授权码**机制：没有有效授权时，插件在网页上完全不工作（不扫描、不起播、不自动下一集），只在页面右下角显示「🔒 插件未授权」卡片，引导用户联系作者获取授权码。
+
+授权为**程序级授权**（v2.1.1 起）：不绑定域名、不绑定平台——授权码只证明"该用户有权使用本程序"，激活后**全部功能、全部已支持网站**均可使用。买家不需要把使用网站发给作者，作者也不需要为每个网站单独签码。
+
+**授权码签发（作者本地运行，不需要服务器）：**
+
+```
+node tools/gen-license.js --days 365 --customer CUST-001
+node tools/gen-license.js --forever --customer 张三 --note "渠道A"
+```
+
+- `--days`：授权天数（默认 365）；`--forever` 为永久；
+- `--customer` / `--note`：客户编号与备注，写进授权码，便于售后溯源；
+- 签发后会输出分组显示的授权码和一段可直接转发给买家的话术；
+- `--domain` 参数已废弃：传入会被忽略并提示（旧版签发的带域名授权码同样不再受域名限制，全站有效）。
+
+**用户激活（两种方式任选）：**
+1. 打开任意已支持的学习网站，页面右下角「🔒 插件未授权」卡片里粘贴授权码 → 点「激活」；
+2. 点浏览器工具栏扩展图标，在弹窗顶部的授权卡里输入激活。
+
+授权码保存在 `chrome.storage.sync`，随 Chrome/Edge 账号同步，换电脑登录同一账号无需再次激活。
+
+**安全边界（如实说明）：** 签名密钥内置在 `license.js`，离线授权码能挡住手动改码的普通用户，挡不住专业逆向。需要更强保护时应改为服务器在线校验。密钥一旦疑似泄露，修改 `license.js` 顶部的 `SIGN_SECRET` 后重新打包，此前签发的授权码立即全部失效（生成器加 `--secret` 可临时兼容轮换期）。`tools/` 目录仅作者本地使用，**不随买家分发包**。
 
 ## 开发者：改动前请跑自检
 
@@ -76,6 +103,8 @@ node tests/run-all.js        # 跑完全部自检，全绿才可合入
 | `tests/selftest_customplayer.js` | 自定义播放器读数与起播（含源码级断言） |
 | `tests/selftest_autostart.js` | 首次起播行为仿真（虚拟时钟驱动真实 tick） |
 | `tests/selftest_videostate.js` | video 状态与空壳过滤 |
+| `tests/selftest_license.js` | 授权算法（SHA-256 向量 / 签名 / 程序级授权 / 过期）+ 授权闸门与待命守卫断言 |
+| `tests/selftest_robust.js` | 健壮性回归：readCustomPlayer/background 行为测试（DOM/chrome API 桩）+ 修复断言 |
 
 新增平台时的约定：在 `PLATFORMS` 里登记，用 `profileAllows(id)` 包住专属分支，并为新平台补一套自检。
 
@@ -88,6 +117,8 @@ node tests/run-all.js        # 跑完全部自检，全绿才可合入
 | `content.css` | 悬浮面板样式 |
 | `popup.html` / `popup.js` | 扩展图标弹窗（设置面板） |
 | `background.js` | 后台看门狗 Service Worker（`chrome.alarms` 驱动，解决后台节流） |
+| `license.js` | 商业授权：离线授权码签发/校验（content script、popup、生成器三方共用） |
+| `tools/gen-license.js` | 授权码生成器（作者本地运行，不随买家分发） |
 | `icons/` | 扩展图标 |
 | `LICENSE` | MIT 许可证全文 |
 | `NOTICE` | 知识产权与著作权声明（中英双语） |
@@ -108,6 +139,31 @@ node tests/run-all.js        # 跑完全部自检，全绿才可合入
 简洁地说：**代码可以免费用，作者的名字不可以拿掉。**
 
 ## 更新日志
+
+### v2.1.2（2026-10-27）全栈体检：5 个 bug 修复 + 性能优化
+
+对全部源码（manifest / background / content / popup / license / shadow_bridge，约 4900 行）做了一次完整通读，修复确认的问题：
+
+- **修复 `readCustomPlayer()` 调用未定义的 `pick()`**：「时长读不到」分支一进去就抛 ReferenceError 被静默吞掉，自定义播放器会被永远当成"暂停中"（现有测试都走"时长读得到"分支，从未覆盖）。
+- **修复 SPA 路由监听重复注册**：待命再唤醒会叠加 popstate/hashchange 监听、反复包装 `pushState`、`1500ms` 轮询 interval 越积越多（且不在 tickTimers 里，待命时清不掉）；改为监听器只装一次 + 轮询纳入 tickTimers 统一管理。
+- **修复 background 标签页注册竞态**：`addTab/removeTab` 原是"异步读 storage → 改 → 写回"，两个标签页几乎同时注册时后写覆盖先写（丢更新），被丢的标签页收不到看门狗唤醒；改为内存数组为单一事实源 + 启动时恢复一次（单 Promise 去重）。
+- **修复 Shadow 桥升级不刷新 matches**：扩展升级后域名清单变了，已注册的 MAIN world 桥不会更新，新域名永远注入不了；改为注册前逐项比对，过期则 `updateContentScripts`（老内核自动降级为"注销 → 重注册"）。
+- **修复面板"空壳 video"统计错误**：改用 `isRealVideoObj` 直接统计，避免页面存在重复 src 的 video 时虚报空壳数量。
+- **健壮性**：`chrome.tabs.sendMessage` 同时兼容 callback 与 Promise 两种 API 形态；起播复查定时器（3s/8s/16s）重新调度前先作废旧句柄；ping 向孙辈 iframe 转发；倍速下拉存储值不在选项内时动态补选项，`updateUI` 对面板控件逐个空值保护。
+- **性能**：video 元素清单与目录容器查找加 TTL 缓存，大页面 CPU 占用显著下降。
+- **测试**：新增 `tests/selftest_robust.js`（44 项），全量回归 **184/184** 通过。
+
+### v2.1.1（2026-10-27）授权改为程序级：不绑定域名/平台
+
+- 授权码 payload 去掉域名字段，**同一授权码在任何网站、任何平台都有效**；旧版（v2.1.1 前）签发的带域名码签名仍然有效且同样不再受域名限制，无需重签。
+- 未授权提示卡移除「当前网站域名 + 一键复制」行（程序级授权不再需要域名信息）；popup 授权卡由"适用网站 xxx"改为"程序级授权（全部功能 · 全部已支持网站）"，引导语由"把网站域名发给作者"改为"联系作者购买授权"。
+- `tools/gen-license.js` 的 `--domain` 改为非必填（传入会被忽略并提示），签发命令简化为 `node tools/gen-license.js --days 365 --customer CUST-001`；`tests/selftest_license.js` 升级为 51 项，全量回归 140/140 通过。
+
+### v2.1.0（2026-10-27）商业授权 + 修复"任何网页都蹦出插件"
+
+- **商业授权（未授权不工作）**：新增 `license.js`，离线授权码方案（无需服务器），未授权时不扫描、不起播、不建面板、不注册看门狗，只在页面右下角显示「🔒 插件未授权」卡片（失败原因 + 作者联系方式 + 授权码输入框）；新增 `tools/gen-license.js` 作者签发工具（不随买家分发包）与 `tests/selftest_license.js`（48 项）。
+- **修复"安装后任何网页都蹦出插件"**：新增启动状态机（`boot → startFull / startProbe / enterStandby`）、待命守卫（看门狗消息 / visibilitychange / window load / SPA 路由变化四个通道待命期直接返回）、`host_permissions` 与 `web_accessible_resources` 从 `<all_urls>` 收紧为与 `content_scripts` 相同的 27 域名白名单。
+- **其它**：`escapeHtml()` 补全引号转义、面板信息行追加授权状态（客户号 / 到期）；全量自检 **137/137** 通过。
 
 ### v2.0.1（2026-10-13）平台名称更正
 
