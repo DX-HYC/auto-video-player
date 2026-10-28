@@ -120,6 +120,195 @@
     return IS_TOP && !isKnownHost() && !hasVideoElement();
   }
 
+  // ==========================================================================
+  // 商业授权闸门（v2.1.0，v2.1.1 起为程序级授权：不绑定域名/平台）
+  // 未授权 → 插件完全不工作：不扫描、不起播、不建面板、不注册看门狗，
+  // 只在页面上给出联系作者获取授权的提示卡。授权码的签发/校验在 license.js
+  // （APLicense），此处只负责"拿码 → 判定 → 放行或拦下"。
+  // ==========================================================================
+  function verifyCurrentLicense() {
+    if (typeof APLicense === 'undefined' || !APLicense || typeof APLicense.verifyLicense !== 'function') {
+      // license.js 未被注入（异常情况）：按未授权处理，商业策略不因缺文件而失效
+      return { ok: false, reason: 'missing', msg: '授权模块加载失败' };
+    }
+    // 程序级授权（v2.1.1）：不传域名，任何网站同一授权码均有效
+    return APLicense.verifyLicense(licenseKey, '', Date.now());
+  }
+
+  function checkLicense(cb) {
+    try {
+      chrome.storage.sync.get({ licenseKey: '' }, (res) => {
+        const v = (res && typeof res.licenseKey === 'string') ? res.licenseKey : '';
+        if (v) licenseKey = v;
+        licenseState = verifyCurrentLicense();
+        if (cb) cb();
+      });
+    } catch (e) {
+      licenseState = verifyCurrentLicense();
+      if (cb) cb();
+    }
+  }
+
+  // 授权码在 popup / 其他标签页被激活或清除后的重新判定
+  function recheckLicense() {
+    const prevOk = !!(licenseState && licenseState.ok);
+    licenseState = verifyCurrentLicense();
+    if (licenseState.ok) {
+      hideLicenseOverlay();
+      if (!prevOk && !fullStarted) { log('授权已生效：' + licenseState.msg); boot(); }
+      return;
+    }
+    // 授权被清除 / 变为无效：立刻停手并提示（没有授权就无法使用）
+    log('授权已失效：' + licenseState.msg);
+    if (fullStarted) enterStandby('授权失效');
+    showLicenseOverlay();
+  }
+
+  function licenseAuthor() {
+    return (typeof APLicense !== 'undefined' && APLicense && APLicense.AUTHOR)
+      ? APLicense.AUTHOR : { name: '', contact: '' };
+  }
+
+  function showLicenseOverlay() {
+    if (!IS_TOP) return;
+    hideLicenseOverlay();
+    const st = licenseState || { ok: false, msg: '未授权' };
+    const author = licenseAuthor();
+    const reason = (typeof APLicense !== 'undefined' && APLicense.reasonText)
+      ? APLicense.reasonText(st) : ('未授权，' + (author.contact || '请联系作者获取授权'));
+    const card = document.createElement('div');
+    card.id = 'ap-license-card';
+    // 标记为扩展自有元素：页面级扫描（找下一集按钮/播放按钮/目录）必须跳过它
+    card.setAttribute('data-ap-own', '1');
+    card.innerHTML =
+      '<div class="ap-lic-title">🔒 插件未授权</div>' +
+      '<div class="ap-lic-reason">' + escapeHtml(reason) + '</div>' +
+      '<div class="ap-lic-author">作者：' + escapeHtml(author.name || '') +
+        (author.contact ? '<br>联系方式：' + escapeHtml(author.contact) : '') + '</div>' +
+      '<div class="ap-lic-row">' +
+        '<input class="ap-lic-input" id="ap-lic-input" type="text" placeholder="粘贴授权码（空格/连字符均可）" spellcheck="false">' +
+        '<button class="ap-lic-btn" id="ap-lic-btn">激活</button>' +
+      '</div>' +
+      '<div class="ap-lic-foot">激活成功后自动生效，无需刷新页面</div>';
+    (document.body || document.documentElement).appendChild(card);
+    const btn = card.querySelector('#ap-lic-btn');
+    const input = card.querySelector('#ap-lic-input');
+    const doActivate = () => tryActivate(input ? input.value : '');
+    if (btn) btn.addEventListener('click', doActivate);
+    if (input) {
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') doActivate(); });
+      setTimeout(() => { try { input.focus(); } catch (e) {} }, 50);
+    }
+  }
+
+  function hideLicenseOverlay() {
+    try {
+      const old = document.getElementById('ap-license-card');
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+    } catch (e) {}
+  }
+
+  // 页面提示卡里输入授权码 → 校验 → 通过则写入 storage 并立即启动
+  function tryActivate(raw) {
+    const st = (typeof APLicense !== 'undefined' && APLicense.verifyLicense)
+      ? APLicense.verifyLicense(raw, '', Date.now())
+      : { ok: false, msg: '授权模块加载失败' };
+    licenseState = st;
+    if (!st.ok) {
+      log('授权码校验失败：' + st.msg);
+      showLicenseOverlay(); // 重新渲染，展示具体失败原因
+      return st;
+    }
+    licenseKey = (typeof raw === 'string') ? raw : '';
+    try { chrome.storage.sync.set({ licenseKey: licenseKey }, () => { void chrome.runtime.lastError; }); } catch (e) {}
+    hideLicenseOverlay();
+    log('授权通过：' + st.msg);
+    if (!fullStarted) boot();
+    return st;
+  }
+
+  // ==========================================================================
+  // 启动状态机（v2.1.0）
+  // 旧行为：域名在白名单里就建面板 + 3s 心跳，于是白名单站的普通页面（首页、
+  // 空间页等没有视频的页面）也永远挂着面板 —— "任何网页都蹦出插件"的成因。
+  // 新行为：
+  //   boot() → 检测到播放内容特征 → startFull() 完整启动
+  //          → 没有任何特征       → startProbe() 只挂一个轻量 MutationObserver
+  //          → 8 秒后仍无特征     → enterStandby() 停掉一切主动行为
+  // 待命期间观察器保留：页面之后真的出现播放内容（SPA 路由、延迟加载）会自动唤醒。
+  // ==========================================================================
+  let fullStarted = false;
+  let mainMo = null;          // observe() 建立的主观察器
+  let probeMo = null;         // 待命观察器（enterStandby 后唯一保留的东西）
+  let tickTimers = [];        // startFull 建立的全部定时器（enterStandby 时统一清）
+  let watchdogPingTimer = null;
+  const PROBE_WINDOW = 8000;
+
+  function isKnownIframeSrc(src) {
+    try { return isKnownHost(new URL(src, location.href).hostname); } catch (e) { return false; }
+  }
+
+  // 页面是否存在"值得启动"的播放内容特征。
+  // 宁可放宽（误判的代价只是面板出现，与旧行为一致），不可漏判（漏判=功能不工作）。
+  function hasPlaybackHints() {
+    try {
+      if (document.querySelector(
+        'video, audio[src], object, embed, .s_point,' +
+        '[class*=bplayer], [class*=course-detail], [id*=learnMenu],' +
+        '[class*=player], [id*=player], [class*=video], [id*=video]'
+      )) return true;
+      const frames = document.querySelectorAll('iframe[src]');
+      for (let i = 0; i < frames.length; i++) {
+        if (isKnownIframeSrc(frames[i].src)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function boot() {
+    if (fullStarted) return;
+    if (hasPlaybackHints()) { startFull(); return; }
+    startProbe();
+  }
+
+  function startProbe() {
+    log('未检测到播放内容，进入待命观察（不建面板、不扫描）');
+    let last = 0;
+    if (typeof MutationObserver === 'function') {
+      try {
+        probeMo = new MutationObserver(() => {
+          const now = Date.now();
+          if (now - last < 500) return;
+          last = now;
+          if (fullStarted) return;
+          if (hasPlaybackHints()) startFull();
+        });
+        probeMo.observe(document.documentElement, { childList: true, subtree: true });
+      } catch (e) {}
+    }
+    setTimeout(() => { if (!fullStarted) enterStandby(); }, PROBE_WINDOW);
+  }
+
+  // 停掉一切主动行为，但保留待命观察器（页面出现播放内容时自动 startFull 唤醒）
+  function enterStandby(reason) {
+    tickTimers.forEach(t => { try { clearInterval(t); } catch (e) {} });
+    tickTimers = [];
+    if (watchdogPingTimer) { try { clearInterval(watchdogPingTimer); } catch (e) {} watchdogPingTimer = null; }
+    watchdogRegistered = false;
+    // SPA 轮询定时器随待命清除；监听器保留（有 fullStarted 守卫，不会误动作），
+    // 唤醒时 watchSpaRoute 会按需重建轮询（spaPollTimer 已置 null）
+    if (spaPollTimer) { try { clearInterval(spaPollTimer); } catch (e) {} spaPollTimer = null; }
+    // 自定义播放器的起播复查定时器（3s/8s/16s 三连）待命时全部作废
+    customRecheckTimers.forEach(t => { try { clearTimeout(t); } catch (e) {} });
+    customRecheckTimers = [];
+    if (mainMo) { try { mainMo.disconnect(); } catch (e) {} mainMo = null; }
+    if (panel && panel.parentNode) { try { panel.parentNode.removeChild(panel); } catch (e) {} }
+    panel = null;
+    fullStarted = false;
+    try { chrome.runtime.sendMessage({ type: 'apUnregister' }, () => { void chrome.runtime.lastError; }); } catch (e) {}
+    log('扩展已待命收手：' + (reason || '页面没有播放内容') + '（发现播放内容会自动恢复）');
+  }
+
   const DEFAULTS = {
     enabled: true,
     // 各平台是否启用（前台可勾选）。关闭的平台所属域名上，扩展完全不动作。
@@ -160,6 +349,25 @@
   let panel = null;
   let infoTimer = null;
 
+  // video 元素清单缓存（v2.1.2 性能优化）。
+  // queryVideos() 会用 querySelectorAll('*') 遍历全文档每一个元素来查找 shadow
+  // 宿主，而它原先被状态上报（1.5s）、保播（3s）、倍速应用、目录兜底等多条路径
+  // 高频重复调用，大页面（上万元素）下是主要 CPU 热点。
+  // 策略：绑定路径 scanVideos() 永远全量刷新（保证新 video 立即绑上事件）；
+  // 读取路径用 cachedVideoList() 取 1.5s TTL 缓存，新增元素由 MutationObserver
+  // 即时触发 scanVideos 刷新，既不漏绑也不再重复全扫。
+  let videoListCache = null;
+  let videoListCacheAt = 0;
+  function cachedVideoList() {
+    if (videoListCache && Date.now() - videoListCacheAt < 1500) {
+      // 过滤已脱离文档的（SPA 换课时后旧播放器被移除）。
+      // 必须用 isConnected 而不是 document.contains：queryVideos 会把同源 iframe
+      // 里的 video 也收进来，那些元素属于子文档，document.contains 对它们恒为 false。
+      return videoListCache.filter(v => { try { return v.isConnected !== false; } catch (e) { return true; } });
+    }
+    return scanVideos();
+  }
+
   const FRAME_ID = Math.random().toString(36).slice(2);
   const TOP_LOGS = [];
   const MAX_LOGS = 80;
@@ -174,11 +382,15 @@
 
   // ---------- 设置同步 ----------
   const SETTINGS_VERSION = '2.0.0';
+  // 授权码（chrome.storage.sync 的 licenseKey，与 settings 同库不同义：settings 管行为，它管能不能用）
+  let licenseKey = '';
+  let licenseState = null;
   function loadSettings(cb) {
     try {
-      chrome.storage.sync.get(Object.assign({ settingsVersion: '' }, DEFAULTS), (res) => {
+      chrome.storage.sync.get(Object.assign({ settingsVersion: '', licenseKey: '' }, DEFAULTS), (res) => {
         const r = res || {};
         settings = Object.assign({}, DEFAULTS, r);
+        licenseKey = typeof r.licenseKey === 'string' ? r.licenseKey : '';
         // platforms 可能被存成不完整对象或 null（其他版本写入过），补齐缺失项，缺的一律视为启用
         const ps = (settings.platforms && typeof settings.platforms === 'object') ? settings.platforms : {};
         settings.platforms = {};
@@ -210,6 +422,11 @@
       let dirty = false;
       for (const k of Object.keys(changes)) {
         if (k in settings) { settings[k] = changes[k].newValue; dirty = true; }
+      }
+      // 授权码在 popup 里被激活 / 清除：立即重新判定，失效则停手
+      if ('licenseKey' in changes) {
+        licenseKey = typeof changes.licenseKey.newValue === 'string' ? changes.licenseKey.newValue : '';
+        recheckLicense();
       }
       if (dirty) {
         // platforms 可能被存成不完整对象，补齐缺失项，缺的一律视为启用
@@ -507,8 +724,11 @@
       if (!IS_TOP || !settings.enabled) return;
 
       if (real.length) {
-        // 起播：开启自动续播，或还没怎么播（ currentTime < 15，刚跳转来的新课时）
-        const needPlay = real.some(v => !v.e && v.p && (settings.autoResume || (v.t || 0) < 15));
+        // 起播：开启自动续播，或还没怎么播（ currentTime < 15，刚跳转来的新课时）。
+        // v2.1.2：新课时首次起播改判 autoStart（与自定义播放器模块的冷启动口径
+        // 一致）—— autoStart 才是"每一节第一次播放"的开关，autoResume 只管续播。
+        const needPlay = real.some(v => !v.e && v.p &&
+          (settings.autoResume || (settings.autoStart !== false && (v.t || 0) < 15)));
         if (needPlay) {
           // 同一播放命令最多每 15 秒提示一次，避免日志每 3 秒刷屏
           const nowP = Date.now();
@@ -692,7 +912,6 @@
   // isTrusted=false，但页面的 keydown 监听器照常触发。
   function pressSpaceOnPlayer() {
     try {
-      const target = clickVideoScreen ? document.body : document.body;
       const opts = { key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true, cancelable: true };
       let el = null;
       try {
@@ -882,6 +1101,11 @@
     const root = findCustomPlayerRoot();
     if (!root) return null;
     const st = { root: root, media: null, cur: 0, dur: 0, paused: true, ended: false, pct: -1, label: '' };
+    // root 作用域内的 querySelector。
+    // v2.1.2 修复：此前这里直接调用未定义的 pick()，"时长读不到"分支一进去就抛
+    // ReferenceError，被外层 try 静默吞掉 —— playing 判定与进度条兜底整段丢失，
+    // 自定义播放器会被永远当成"暂停中"。
+    const pick = (sel) => { try { return root.querySelector(sel); } catch (e) { return null; } };
     try {
       const rootCls = (root.id ? root.id + ' ' : '') + (typeof root.className === 'string' ? root.className : '');
       st.label = String(rootCls).replace(/\s+/g, ' ').slice(0, 40);
@@ -953,7 +1177,7 @@
   // 把自定义播放器伪装成标准 video 状态上报（仅在"本帧无真实 video"时注入）
   function customPlayerAsState() {
     try {
-      if (queryVideos(document).some(isRealVideo)) return null;
+      if (cachedVideoList().some(isRealVideo)) return null;
       if (hasShadowVideo()) return null;
       const st = readCustomPlayer();
       if (!st) return null;
@@ -1079,9 +1303,15 @@
 
   // 点完起播后按 3s / 8s / 16s 三次复查：没有真的播起来就升级到下一种点击方式。
   // 铁律：任何一条证据表明"已经在播了"都必须立刻收手 —— 继续点只会把它点成暂停。
+  // v2.1.2：复查定时器句柄统一收集，每次重新调度前先作废未执行的旧句柄 ——
+  // 否则播放卡住时每 6 秒触发一轮 customPlayerPlay 就多排 3 个 setTimeout，
+  // 几分钟内能积压十几个，既浪费又可能在播放恢复后连环误点。
+  let customRecheckTimers = [];
   function customPlayRecheck(base) {
+    customRecheckTimers.forEach(t => { try { clearTimeout(t); } catch (e) {} });
+    customRecheckTimers = [];
     [3000, 8000, 16000].forEach(delay => {
-      setTimeout(() => {
+      customRecheckTimers.push(setTimeout(() => {
         try {
           if (!settings.enabled) return;
           const s2 = readCustomPlayer();
@@ -1091,12 +1321,16 @@
           if (s2.cur > base + 0.5) { customPrev.at = Date.now(); customBooted = true; return; }
           customPlayerPlay();
         } catch (e) {}
-      }, delay);
+      }, delay));
     });
   }
 
   // 认定为"换了一节课 / 页面重新打开过" → 冷启动状态重置，重新获得一次首次起播机会
   function customReboot(now, cur) {
+    // 上一轮的起播复查定时器全部作废：它们持有的 base 是旧播放器的位置，
+    // 若残留会在新课时上误判"位置没推进"而重复点击
+    customRecheckTimers.forEach(t => { try { clearTimeout(t); } catch (e) {} });
+    customRecheckTimers = [];
     customBootAt = now;
     customBootBase = cur;
     customBooted = false;
@@ -1241,7 +1475,7 @@
     if (!settings.enabled) return;
     if (!activePlatformAllowed()) return;
     try {
-      const videos = queryVideos(document);
+      const videos = cachedVideoList();
       // 只统计"真实可播"的 video：页面常驻的摄像头/人脸检测 <video> 一直处于 playing
       // 状态，若算进来会误判"已有视频在播"，把页面播放按钮兜底这条唯一出路也堵死。
       const playing = videos.some(v => isRealVideo(v) && !v.paused && !v.ended);
@@ -1299,7 +1533,7 @@
 
   function applySpeedToAll() {
     try {
-      queryVideos(document).forEach(applySpeed);
+      cachedVideoList().forEach(applySpeed);
       // 关闭 Shadow DOM 里的播放器：经主世界桥下发倍率命令
       if (IS_TOP && hasShadowVideo()) shadowCmd('rate', currentRate());
     } catch (e) {}
@@ -1331,12 +1565,14 @@
 
   function scanVideos() {
     const videos = queryVideos(document);
+    videoListCache = videos;
+    videoListCacheAt = Date.now();
     videos.forEach(attachVideo);
     return videos;
   }
 
   function getLocalVideoState() {
-    const arr = queryVideos(document).map(v => ({
+    const arr = cachedVideoList().map(v => ({
       currentTime: v.currentTime || 0,
       duration: v.duration || 0,
       paused: v.paused,
@@ -1385,6 +1621,7 @@
       if (needScan) scanVideos();
     });
     mo.observe(document.documentElement, { childList: true, subtree: true });
+    mainMo = mo; // 存句柄：enterStandby() 需要断开它
   }
 
   // ---------- 课程目录解析 ----------
@@ -1511,8 +1748,22 @@
   }
 
   // 递归查找目录容器（跨所有同域 iframe，取评分最高的容器）
+  // v2.1.2 性能：analyzeList 每 1.5~3 秒被调用一次，而本函数会跑三十多组
+  // querySelectorAll 全文档扫描 + 对每个候选读 getBoundingClientRect（强制回流），
+  // 是页面 CPU 占用的另一大热点。目录容器结构本身变化缓慢，加 1.2s TTL 缓存
+  // （document.contains 校验）：SPA 换课时旧容器被移除会立即失效重扫，
+  // clickNext 的跳转后校验（+2s）也必然拿到新结果，不影响正确性。
+  let catalogContainerCache = { el: null, ts: 0 };
   function findCatalogContainer(root) {
     root = root || document;
+    if (root === document) {
+      try {
+        if (catalogContainerCache.el && Date.now() - catalogContainerCache.ts < 1200 &&
+            document.contains(catalogContainerCache.el)) {
+          return catalogContainerCache.el;
+        }
+      } catch (e) {}
+    }
     const candidates = [];
     const visited = new Set();
 
@@ -1533,7 +1784,9 @@
 
     collect(root);
     candidates.sort((a, b) => b.score - a.score);
-    return candidates.length ? candidates[0].el : null;
+    const result = candidates.length ? candidates[0].el : null;
+    if (root === document) catalogContainerCache = { el: result, ts: Date.now() };
+    return result;
   }
 
   function getItemScore(el) {
@@ -2652,9 +2905,10 @@
   function updateUI() {
     if (!panel) return;
     const startChk = panel.querySelector('#ap-start'); if (startChk) startChk.checked = settings.autoStart !== false;
-    panel.querySelector('#ap-resume').checked = !!settings.autoResume;
-    panel.querySelector('#ap-next').checked = !!settings.autoNext;
-    panel.querySelector('#ap-speed').checked = !!settings.speedEnabled;
+    // 逐个空值保护：面板 DOM 未来若调整，缺一个元素不应让整个 updateUI 抛错
+    const resumeChk = panel.querySelector('#ap-resume'); if (resumeChk) resumeChk.checked = !!settings.autoResume;
+    const nextChk = panel.querySelector('#ap-next'); if (nextChk) nextChk.checked = !!settings.autoNext;
+    const speedChk = panel.querySelector('#ap-speed'); if (speedChk) speedChk.checked = !!settings.speedEnabled;
     // 面板内的平台勾选框同步一次（popup 里改过之后这里要跟上）
     try {
       panel.querySelectorAll('.ap-plat').forEach(row => {
@@ -2667,7 +2921,18 @@
       if (pn) pn.textContent = '当前：' + platformInfo().name;
     } catch (e) {}
     const sv = panel.querySelector('#ap-speed-val');
-    if (sv) sv.value = String(currentRate());
+    if (sv) {
+      const rate = String(currentRate());
+      // 存储了选项外的倍率（历史数据/手动改 storage）时动态补一个选项，
+      // 否则 select.value 赋不上值会显示空白
+      if (!Array.prototype.some.call(sv.options, o => o.value === rate)) {
+        const opt = document.createElement('option');
+        opt.value = rate;
+        opt.textContent = rate + 'x';
+        sv.appendChild(opt);
+      }
+      sv.value = rate;
+    }
     updateStatus();
     updateInfo();
   }
@@ -2865,7 +3130,9 @@
     }
 
     const frameCount = Object.keys(frameStates).length;
-    const shellCount = getAggregatedVideos(true).length - videoCount;
+    // 空壳数直接按 isRealVideoObj 统计（v2.1.2 修复：此前用"全部 - 按 src 去重后的
+    // 真实视频数"相减，页面存在重复 src 的 video 时会虚报空壳数量）
+    const shellCount = getAggregatedVideos(true).filter(v => !isRealVideoObj(v)).length;
     const hasCustomPlayer = agg.some(v => v.from === 'custom');
     let noVideoHint = '';
     if (hasCustomPlayer) {
@@ -2874,7 +3141,8 @@
       noVideoHint = ' · 播放器不可直接控制，按目录进度驱动';
       if (shellCount > 0) noVideoHint += `（页面 ${shellCount} 个空壳 video 已忽略）`;
     }
-    info.textContent = `检测到 ${videoCount} 个视频（${frameCount} 帧） · 目录 ${total} 项${noVideoHint}`;
+    info.textContent = `检测到 ${videoCount} 个视频（${frameCount} 帧） · 目录 ${total} 项${noVideoHint}` +
+      (licenseState && licenseState.ok ? ` · ${licenseState.msg}` : '');
 
     updateLogs();
   }
@@ -2888,7 +3156,9 @@
   }
 
   function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function makeDraggable(el, handle) {
@@ -2931,8 +3201,10 @@
     }
 
     if (d.type === 'ping') {
-      // 收到 ping 立即扫描上报
+      // 收到 ping 立即扫描上报，并继续向本级子 iframe 转发 ——
+      // 否则孙辈 iframe（iframe 里的 iframe）永远收不到顶层的心跳
       analyzeAndReport();
+      if (d.broadcastDown) { try { broadcastDown({ type: 'ping' }); } catch (e) {} }
       return;
     }
 
@@ -2982,13 +3254,25 @@
   // ---------- SPA 路由变化监听 ----------
   // 现代学习平台（Vue/React，如江西师范大学 zjpt）切换视频时不刷新页面，
   // content script 不会被重新执行，必须主动感知 URL 变化后重新扫描视频与目录。
+  //
+  // v2.1.2 修复：此前 watchSpaRoute 没有防重入标志 —— 页面先待命（enterStandby）
+  // 再被播放内容唤醒（startFull）时会再次调用本函数，导致 popstate/hashchange
+  // 监听器叠加、history.pushState 被反复包装（每层包装多触发一次 onChange）、
+  // 1500ms 轮询 interval 越积越多；且该 interval 不在 tickTimers 里，待命时清不掉。
+  // 现在：监听器只装一次（spaListenersInstalled），轮询定时器纳入 tickTimers 统一
+  // 管理（待命清除、唤醒时按需重建）。
+  let spaListenersInstalled = false;
+  let spaPollTimer = null;
+  let spaLastUrl = '';
   function watchSpaRoute() {
-    let lastUrl = location.href;
+    try { spaLastUrl = location.href; } catch (e) { spaLastUrl = ''; }
     const onChange = () => {
+      // 待命期间不响应路由变化（本页无播放内容，跳转扫描交给待命观察器判断）
+      if (!fullStarted) return;
       let now;
       try { now = location.href; } catch (e) { return; }
-      if (!now || now === lastUrl) return;
-      lastUrl = now;
+      if (!now || now === spaLastUrl) return;
+      spaLastUrl = now;
       log('检测到路由变化，重新分析：', now.slice(0, 120));
       // 重置上一轮跳转状态，避免旧锁与旧视频残留影响新一轮
       lastClickAt = 0;
@@ -3017,26 +3301,35 @@
       setTimeout(redo, 2500);
     };
 
-    window.addEventListener('popstate', onChange);
-    window.addEventListener('hashchange', onChange);
+    if (!spaListenersInstalled) {
+      spaListenersInstalled = true;
+      window.addEventListener('popstate', onChange);
+      window.addEventListener('hashchange', onChange);
 
-    // 劫持 pushState / replaceState：SPA 路由常用，且不触发原生事件
-    try {
-      const wrap = (name) => {
-        const orig = history[name];
-        if (typeof orig !== 'function') return;
-        history[name] = function () {
-          const r = orig.apply(this, arguments);
-          try { onChange(); } catch (e) {}
-          return r;
+      // 劫持 pushState / replaceState：SPA 路由常用，且不触发原生事件
+      try {
+        const wrap = (name) => {
+          const orig = history[name];
+          if (typeof orig !== 'function' || orig.__apWrapped) return; // 防重复包装
+          const wrapped = function () {
+            const r = orig.apply(this, arguments);
+            try { onChange(); } catch (e) {}
+            return r;
+          };
+          wrapped.__apWrapped = true;
+          history[name] = wrapped;
         };
-      };
-      wrap('pushState');
-      wrap('replaceState');
-    } catch (e) {}
+        wrap('pushState');
+        wrap('replaceState');
+      } catch (e) {}
+    }
 
-    // 兜底轮询：部分框架直接改地址栏，不走 history API
-    setInterval(onChange, 1500);
+    // 兜底轮询：部分框架直接改地址栏，不走 history API。
+    // 纳入 tickTimers：待命时随 enterStandby 清除，唤醒时若已被清则重建。
+    if (!spaPollTimer) {
+      spaPollTimer = setInterval(onChange, 1500);
+      tickTimers.push(spaPollTimer);
+    }
   }
 
   // ---------- 后台保活：看门狗 ----------
@@ -3057,7 +3350,8 @@
       watchdogRegistered = true;
       ping();
       // 周期性重注册，顺带唤醒 service worker；只要注册成功一次，闹钟就会持续生效
-      setInterval(ping, 45000);
+      watchdogPingTimer = setInterval(ping, 45000); // 存句柄：enterStandby() 需要清掉它
+      tickTimers.push(watchdogPingTimer);
     } catch (e) {}
   }
 
@@ -3094,6 +3388,8 @@
   try {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg && msg.type === 'apWatchdog') {
+        // 待命期间不响应看门狗：没有播放内容的页面不应被反复唤醒扫描
+        if (!fullStarted) return false;
         watchdogTick();
         if (sendResponse) sendResponse({ ok: true });
         return true;
@@ -3105,6 +3401,8 @@
   // 页面从后台恢复可见时，立即补齐后台节流期间遗漏的动作
   document.addEventListener('visibilitychange', () => {
     if (isDocHidden()) return;
+    // 待命期间不动作：本页没有播放内容，恢复可见也不该开始扫描
+    if (!fullStarted) return;
     setTimeout(() => {
       try {
         scanVideos();
@@ -3137,43 +3435,63 @@
         }
         return;
       }
-      log('当前平台：' + platformInfo().name + '（' + ACTIVE_PROFILE + '）· ' + platformInfo().desc);
-      observe();
-      watchSpaRoute();
-      registerWatchdog();
-      if (IS_TOP) {
-        ensureUI();
-        if (infoTimer) clearInterval(infoTimer);
-        infoTimer = setInterval(() => {
-          try {
-            analyzeAndReport();
-            ensurePlaying();
-            customPlayerTick();
-            checkShadowVideos();
-            catalogDrivenTick();
-            if (panel) updateInfo();
-          } catch (e) { log('tick error', (e && e.message) || e); }
-          // 定时 ping 子帧，防止 iframe 加载晚于 content script（降低频率减少开销与风险）
-          try { broadcastDown({ type: 'ping' }); } catch (e) {}
-        }, 3000);
-        setInterval(scanVideos, 2000);
-        // 心跳集中 try 包裹：任何一个环节抛错都不能拖垮整条连播链路
-        setInterval(() => { try { customPlayerTick(); } catch (e) {} }, 2000);
-        setInterval(() => {
-          const now = Date.now();
-          const maxAge = frameStateMaxAge();
-          for (const k of Object.keys(frameStates)) {
-            if (now - frameStates[k].ts > maxAge) delete frameStates[k];
-          }
-        }, 5000);
-        log('顶层初始化完成', location.href);
-      } else {
-        setInterval(() => { analyzeAndReport(); }, 1500);
-        setInterval(() => { try { customPlayerTick(); } catch (e) {} }, 2000);
-        setInterval(scanVideos, 2000);
-        log('子帧初始化完成', location.href, '| 已知平台:', isKnownHost(), '| video元素:', hasVideoElement());
-      }
+      // 授权闸门优先于一切启动：未授权只显示联系作者的提示卡，不扫描、不起播、不建面板
+      checkLicense(() => {
+        if (!licenseState || !licenseState.ok) {
+          log('未授权，插件不工作：' + (licenseState ? licenseState.msg : ''));
+          showLicenseOverlay();
+          return;
+        }
+        boot();
+      });
     });
+  }
+
+  // 完整启动（授权通过 + 有播放内容特征时才走到这里）
+  function startFull() {
+    if (fullStarted) return;
+    fullStarted = true;
+    // 待命观察器已完成使命（唤醒了本次启动）：断开它，避免与 observe() 的主观察器
+    // 重复触发同一批扫描（v2.1.2 修复：此前唤醒后 probeMo 一直挂着）
+    if (probeMo) { try { probeMo.disconnect(); } catch (e) {} probeMo = null; }
+    log('当前平台：' + platformInfo().name + '（' + ACTIVE_PROFILE + '）· ' + platformInfo().desc);
+    if (licenseState && licenseState.ok) log('授权状态：' + licenseState.msg);
+    observe();
+    watchSpaRoute();
+    registerWatchdog();
+    if (IS_TOP) {
+      ensureUI();
+      if (infoTimer) clearInterval(infoTimer);
+      infoTimer = setInterval(() => {
+        try {
+          analyzeAndReport();
+          ensurePlaying();
+          customPlayerTick();
+          checkShadowVideos();
+          catalogDrivenTick();
+          if (panel) updateInfo();
+        } catch (e) { log('tick error', (e && e.message) || e); }
+        // 定时 ping 子帧，防止 iframe 加载晚于 content script（降低频率减少开销与风险）
+        try { broadcastDown({ type: 'ping' }); } catch (e) {}
+      }, 3000);
+      tickTimers.push(infoTimer);
+      tickTimers.push(setInterval(scanVideos, 2000));
+      // 心跳集中 try 包裹：任何一个环节抛错都不能拖垮整条连播链路
+      tickTimers.push(setInterval(() => { try { customPlayerTick(); } catch (e) {} }, 2000));
+      tickTimers.push(setInterval(() => {
+        const now = Date.now();
+        const maxAge = frameStateMaxAge();
+        for (const k of Object.keys(frameStates)) {
+          if (now - frameStates[k].ts > maxAge) delete frameStates[k];
+        }
+      }, 5000));
+      log('顶层初始化完成', location.href);
+    } else {
+      tickTimers.push(setInterval(() => { analyzeAndReport(); }, 1500));
+      tickTimers.push(setInterval(() => { try { customPlayerTick(); } catch (e) {} }, 2000));
+      tickTimers.push(setInterval(scanVideos, 2000));
+      log('子帧初始化完成', location.href, '| 已知平台:', isKnownHost(), '| video元素:', hasVideoElement());
+    }
   }
 
   // 等待 document 和 iframe 内部资源尽量就绪后再开始
@@ -3191,6 +3509,8 @@
     // 页面完全加载后再扫一次（处理 iframe 晚加载）
     window.addEventListener('load', () => {
       setTimeout(() => {
+        // 待命期间不扫描：没有播放内容的页面加载完成也不该启动
+        if (!fullStarted) return;
         scanVideos();
         analyzeAndReport();
         // 诊断：输出页面全部 iframe 地址，便于判断播放器是否位于跨域 iframe
