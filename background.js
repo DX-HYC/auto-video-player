@@ -39,6 +39,10 @@ const MAX_TABS = 30;
 // attachShadow 钩子就永远截获不到引用。chrome.scripting.registerContentScripts 支持
 // world:'MAIN' + runAt:'document_start'，由浏览器原生注入 —— 零竞态、不受页面 CSP
 // 限制，比 <script src> / executeScript 动态注入都可靠（Chrome 111+，Edge 同步支持）。
+//
+// v2.1.2 修复：此前 onInstalled 时若发现桥已注册就直接返回，不比较 matches ——
+// 扩展升级后若 manifest 的域名清单变了（新增平台），已注册的桥不会更新，
+// 新域名上永远注入不了 MAIN world 桥。现在逐项比对，不一致就更新。
 const BRIDGE_SCRIPT_ID = 'ap-shadow-bridge-main';
 function registerShadowBridge() {
   try {
@@ -46,22 +50,38 @@ function registerShadowBridge() {
     const matches = (chrome.runtime.getManifest().content_scripts || [])
       .flatMap(cs => cs.matches || []);
     if (!matches.length) return;
+    const keyOf = (list) => JSON.stringify([...list].sort());
     chrome.scripting.getRegisteredContentScripts((scripts) => {
-      if (chrome.runtime.lastError) { doRegister(); return; }
-      if ((scripts || []).some(s => s.id === BRIDGE_SCRIPT_ID)) return;
-      doRegister();
+      const existing = (scripts || []).find(s => s.id === BRIDGE_SCRIPT_ID) || null;
+      // 已注册且 matches 一致：无需动作
+      if (existing && keyOf(existing.matches || []) === keyOf(matches)) return;
+      const doRegister = () => {
+        chrome.scripting.registerContentScripts([{
+          id: BRIDGE_SCRIPT_ID,
+          js: ['shadow_bridge.js'],
+          matches: matches,
+          runAt: 'document_start',
+          world: 'MAIN',
+          allFrames: true,
+          persistAcrossSessions: true
+        }], () => { void chrome.runtime.lastError; });
+      };
+      if (!existing) { doRegister(); return; }
+      // 已注册但 matches 过期：优先原地更新，老内核没有 updateContentScripts 则
+      // 走"注销 → 重注册"
+      if (chrome.scripting.updateContentScripts) {
+        chrome.scripting.updateContentScripts([{
+          id: BRIDGE_SCRIPT_ID,
+          matches: matches
+        }], () => {
+          if (chrome.runtime.lastError) {
+            chrome.scripting.unregisterContentScripts({ ids: [BRIDGE_SCRIPT_ID] }, () => doRegister());
+          }
+        });
+      } else {
+        chrome.scripting.unregisterContentScripts({ ids: [BRIDGE_SCRIPT_ID] }, () => doRegister());
+      }
     });
-    function doRegister() {
-      chrome.scripting.registerContentScripts([{
-        id: BRIDGE_SCRIPT_ID,
-        js: ['shadow_bridge.js'],
-        matches: matches,
-        runAt: 'document_start',
-        world: 'MAIN',
-        allFrames: true,
-        persistAcrossSessions: true
-      }], () => { void chrome.runtime.lastError; });
-    }
   } catch (e) {}
 }
 registerShadowBridge();
@@ -78,46 +98,70 @@ function ensureAlarm() {
   } catch (e) {}
 }
 
-// 部分旧版本 Chrome 没有 chrome.storage.session，这里统一降级到内存缓存
+// 部分旧版本 Chrome 没有 chrome.storage.session，这里统一降级到内存缓存。
+// v2.1.2 修复：此前 addTab/removeTab 是"异步读 storage → 改 → 写回"的
+// 读-改-写模式，两个标签页几乎同时注册时后写会覆盖先写（丢更新），
+// 被丢掉的标签页再也收不到看门狗唤醒。现在 memTabs 是唯一事实源：
+// 改动同步作用于内存数组再落盘，SW 重启后首次使用前从 session storage 恢复一次
+// （loadTabsOnce 用单 Promise 去重，恢复期间的并发改动排队在其后，不会丢）。
 const memTabs = [];
+let tabsLoaded = false;
+let tabsLoadPromise = null;
 
-function readTabs(cb) {
-  try {
-    if (chrome.storage && chrome.storage.session) {
-      chrome.storage.session.get(TABS_KEY, (r) => {
-        const v = chrome.runtime.lastError ? null : (r && r[TABS_KEY]);
-        cb(Array.isArray(v) ? v : memTabs.slice());
-      });
-      return;
-    }
-  } catch (e) {}
-  cb(memTabs.slice());
+function loadTabsOnce() {
+  if (tabsLoaded) return Promise.resolve();
+  if (tabsLoadPromise) return tabsLoadPromise;
+  tabsLoadPromise = new Promise((resolve) => {
+    try {
+      if (chrome.storage && chrome.storage.session) {
+        chrome.storage.session.get(TABS_KEY, (r) => {
+          const v = chrome.runtime.lastError ? null : (r && r[TABS_KEY]);
+          if (Array.isArray(v)) {
+            memTabs.length = 0;
+            v.forEach(x => { if (x && x.id != null) memTabs.push(x); });
+          }
+          tabsLoaded = true;
+          resolve();
+        });
+        return;
+      }
+    } catch (e) {}
+    tabsLoaded = true;
+    resolve();
+  });
+  return tabsLoadPromise;
 }
 
-function writeTabs(list) {
-  const trimmed = list.slice(-MAX_TABS);
-  memTabs.length = 0;
-  memTabs.push(...trimmed);
+function persistTabs() {
   try {
     if (chrome.storage && chrome.storage.session) {
-      chrome.storage.session.set({ [TABS_KEY]: trimmed });
+      chrome.storage.session.set({ [TABS_KEY]: memTabs.slice(-MAX_TABS) });
     }
   } catch (e) {}
+}
+
+function readTabs(cb) {
+  loadTabsOnce().then(() => cb(memTabs.slice()));
 }
 
 function addTab(tabId) {
   if (tabId == null) return;
-  readTabs((list) => {
-    const filtered = list.filter(x => x && x.id !== tabId);
+  loadTabsOnce().then(() => {
+    const filtered = memTabs.filter(x => x && x.id !== tabId);
     filtered.push({ id: tabId, ts: Date.now() });
-    writeTabs(filtered);
+    memTabs.length = 0;
+    filtered.slice(-MAX_TABS).forEach(x => memTabs.push(x));
+    persistTabs();
   });
 }
 
 function removeTab(tabId) {
   if (tabId == null) return;
-  readTabs((list) => {
-    writeTabs(list.filter(x => x && x.id !== tabId));
+  loadTabsOnce().then(() => {
+    const filtered = memTabs.filter(x => x && x.id !== tabId);
+    memTabs.length = 0;
+    filtered.forEach(x => memTabs.push(x));
+    persistTabs();
   });
 }
 
@@ -161,8 +205,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     list.forEach((entry) => {
       if (!entry || entry.id == null) return;
       try {
-        chrome.tabs.sendMessage(entry.id, { type: 'apWatchdog' })
-          .catch(() => removeTab(entry.id));
+        // 兼容两种 API 形态：新版返回 Promise（catch 里移除失效标签页），
+        // 老版只有 callback（lastError 里移除）。v2.1.2 修复：此前直接
+        // .catch()，在只支持 callback 的内核上会抛 TypeError 导致后续
+        // 标签页全部漏 ping。
+        const maybePromise = chrome.tabs.sendMessage(entry.id, { type: 'apWatchdog' }, () => {
+          if (chrome.runtime.lastError) removeTab(entry.id);
+        });
+        if (maybePromise && typeof maybePromise.catch === 'function') {
+          maybePromise.catch(() => removeTab(entry.id));
+        }
       } catch (e) {}
     });
   });
