@@ -215,6 +215,22 @@ node tests/run-all.js        # 跑完全部自检，全绿才可合入
 - **性能**：video 元素清单与目录容器查找加 TTL 缓存，大页面 CPU 占用显著下降。
 - **测试**：新增 `tests/selftest_robust.js`（44 项），全量回归 **184/184** 通过。
 
+### v2.2.2（2026-11-13）授权站启用 SSL，在线通道全面切到 https
+
+- `auth-online.js`：`API_BASE` 由 `http://` 改为 `https://auth.dixunblog.cn/api/v2/`，激活 / 心跳 / 刷新 / 试用等子请求都基于该常量，一处改动全覆盖。
+- `manifest.json`：版本 2.2.2；`host_permissions` 原本就同时覆盖 http/https，CSP 未限制 `connect-src`，**权限与 CSP 均无需改动**。
+- 老包（v2.2.1）的 http 请求会被 301 自动跟随，**不升级也不会立刻失效**；持 `AVP1` 离线码的用户完全不受影响。
+
+### v2.2.1（2026-11-12）填入真实 AppKey + 真实服务器验证 + 双授权兼容加固
+
+- 真实服务器端到端验证通过：填入后台 AppKey 后用真实卡密跑通 `init.php → activate.php → heartbeat.php`，返回「激活成功 · 剩余 30 天」、心跳 200、签名模式 `values`。
+- **双授权兼容**：在线会话有效时优先按在线显示；其余情况只要本机有作者签发的有效 `AVP1` 离线码就**独立放行**，不受在线会话过期、断网宽限、后台 403/410 停用或到期影响。v2.1.x 老用户升级后**无需重签、无需重新激活、无需联网**。
+
+### v2.2.0（2026-11-12）接入 V2 在线授权系统（在线卡密 + 应急离线码）
+
+- 主授权通道改为作者自建的 `auth.dixunblog.cn/api/v2/` 在线授权系统：`init / activate / heartbeat / refresh` 五个接口，RSA-2048 加密传输、SHA-256 签名、JWT 令牌、5 秒心跳、后台可远程停用；授权仍为**程序级**（不绑定域名/平台），激活后全功能全站可用。原离线授权码保留为**应急备用通道**（服务器宕机 / 断网时本地验签生效）。
+- 新增 `auth-online.js`（纯 JS BigInt 实现 RSAES-PKCS1-v1.5 分块加密）、`offscreen.html/js` + `heartbeat-worker.js`（MV3 Service Worker 会被回收，用离屏文档里的 Web Worker 承载 5 秒节拍，经 `runtime.Port` 点对点唤醒 SW 执行心跳）。
+
 ### v2.1.1（2026-10-27）授权改为程序级：不绑定域名/平台
 
 - 授权码 payload 去掉域名字段，**同一授权码在任何网站、任何平台都有效**；旧版（v2.1.1 前）签发的带域名码签名仍然有效且同样不再受域名限制，无需重签。
