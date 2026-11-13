@@ -23,8 +23,6 @@
  * -----------------------------------------------------------------------------
  *
  * 【V2 授权系统 · 浏览器扩展接入层】
- * 注意：本公开仓库为脱敏副本，APP_KEY / CLIENT_SECRET 为占位符；
- *       可运行的完整配置见作者分发的安装包。
  *
  * 服务端：https://auth.dixunblog.cn/api/v2/{init,activate,heartbeat,refresh,trial}.php
  *          （2026-11-13 授权站启用 SSL，http 已由服务器 301 跳转到 https）
