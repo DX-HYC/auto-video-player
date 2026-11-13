@@ -30,6 +30,149 @@
 // 再由它向已注册的标签页发消息（消息投递会立即执行页面的 JS，同样不受节流限制），
 // 从而让内容脚本在后台仍能定期检查并补跳下一集。
 
+// ==========================================================================
+// 在线授权总线（v2.2.0 · 接入 auth.dixunblog.cn V2 授权系统）
+// --------------------------------------------------------------------------
+// 所有网络请求集中在 Service Worker：content script 运行在 https 学习页面上，
+// 直接 fetch http 授权接口会被混合内容策略拦截；由 SW 发起则不受影响。
+// 状态单点存放在 chrome.storage.local，content / popup 只查询与订阅广播。
+// ==========================================================================
+let APOnlineClient = null;
+try {
+  if (typeof importScripts === 'function') {
+    importScripts('license.js', 'auth-online.js');
+    APOnlineClient = (typeof APOnline !== 'undefined' && APOnline) ? APOnline : null;
+  } else if (typeof require === 'function') {
+    // Node 自检环境：同一份模块直接 require，保证测试与运行是同一套算法
+    APOnlineClient = require('./auth-online.js');
+  }
+} catch (e) { APOnlineClient = null; }
+
+const OFFSCREEN_PATH = 'offscreen.html';
+let offscreenCreating = null;
+let lastAuthSnapshot = '';
+
+function authSnapshot(state) {
+  if (!state) return '';
+  return [state.ok, state.mode, state.reason, state.msg, state.expireAt, state.source].join('|');
+}
+
+function broadcastAuth(state) {
+  if (!state) return false;
+  const snap = authSnapshot(state);
+  if (snap === lastAuthSnapshot) return false;   // 5 秒一次心跳不产生消息风暴
+  lastAuthSnapshot = snap;
+  try {
+    chrome.runtime.sendMessage({ type: 'apAuthChanged', state }, () => { void chrome.runtime.lastError; });
+  } catch (e) {}
+  return true;
+}
+
+// 幂等创建离屏文档：Chrome 116+ 用 getContexts 精确判断；老内核直接创建，
+// "已存在"错误忽略即可。creating 承诺防止两个事件同时创建（只能存在一个）。
+function ensureOffscreen() {
+  return (async () => {
+    try {
+      if (!chrome.offscreen || !chrome.offscreen.createDocument) return;
+      if (chrome.runtime.getContexts) {
+        const contexts = await chrome.runtime.getContexts({
+          contextTypes: ['OFFSCREEN_DOCUMENT'],
+          documentUrls: [chrome.runtime.getURL(OFFSCREEN_PATH)]
+        });
+        if (contexts && contexts.length) return;
+      }
+      if (offscreenCreating) return offscreenCreating;
+      offscreenCreating = Promise.resolve(chrome.offscreen.createDocument({
+        url: OFFSCREEN_PATH,
+        reasons: ['WORKERS'],
+        justification: '用 Web Worker 承载授权服务端要求的 5 秒心跳定时器'
+      })).catch(() => {}).finally(() => { offscreenCreating = null; });
+      return offscreenCreating;
+    } catch (e) { return null; }
+  })();
+}
+
+// 在线会话结束（切回纯离线码 / 清除授权）后关闭离屏文档，停止 5 秒敲门。
+// 老授权用户不该为了一套用不上的在线心跳常驻隐藏页面。
+async function stopOffscreen() {
+  try {
+    if (!chrome.offscreen || !chrome.offscreen.closeDocument) return;
+    if (chrome.runtime.getContexts) {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ['OFFSCREEN_DOCUMENT'],
+        documentUrls: [chrome.runtime.getURL(OFFSCREEN_PATH)]
+      });
+      if (!contexts || !contexts.length) return;
+    }
+    await chrome.offscreen.closeDocument();
+  } catch (e) {}
+}
+
+let heartbeatInFlight = null;
+function onHeartbeatTick() {
+  if (!APOnlineClient || heartbeatInFlight) return heartbeatInFlight;
+  heartbeatInFlight = (async () => {
+    try {
+      // 纯离线码用户（v2.1.x 老授权）没有在线令牌：不发请求、不查状态，
+      // 直接收手并关掉离屏文档，避免每 5 秒无谓唤醒 Service Worker。
+      const s0 = await APOnlineClient.loadState();
+      if (!s0 || !s0.token) { await stopOffscreen(); return; }
+      const r = await APOnlineClient.heartbeat();
+      const state = (r && r.state) || await APOnlineClient.getStatus();
+      broadcastAuth(state);
+      if (state && state.source === 'online') ensureOffscreen();
+    } catch (e) {}
+    finally { heartbeatInFlight = null; }
+  })();
+  return heartbeatInFlight;
+}
+
+// 页面/弹窗启动时的会话恢复：令牌过期自动 refresh 并补一次心跳。
+// 多个 iframe 同时查询时去重 + 10 秒节流，避免重复刷新令牌。
+let sessionEnsureAt = 0;
+let sessionPromise = null;
+function ensureSessionThrottled(force) {
+  if (!APOnlineClient) return Promise.resolve(null);
+  const now = Date.now();
+  if (sessionPromise) return sessionPromise;
+  if (!force && now - sessionEnsureAt < 10000) return Promise.resolve(null);
+  sessionEnsureAt = now;
+  sessionPromise = Promise.resolve(APOnlineClient.ensureSession())
+    .then((r) => { if (r && r.state) broadcastAuth(r.state); return r; })
+    .catch(() => null)
+    .finally(() => { sessionPromise = null; });
+  return sessionPromise;
+}
+
+// SW 里在线模块加载失败时的降级：仍允许作者签发的应急离线码工作
+function localOfflineState() {
+  return new Promise((resolve) => {
+    let raw = '';
+    try {
+      chrome.storage.sync.get({ licenseKey: '' }, (r) => {
+        raw = (r && r.licenseKey) || '';
+        finish();
+      });
+    } catch (e) { finish(); }
+    function finish() {
+      const L = (typeof APLicense !== 'undefined' && APLicense) ? APLicense : null;
+      const st = (raw && L && L.verifyLicense)
+        ? L.verifyLicense(raw, '', Date.now()) : { ok: false, msg: '未授权：请输入授权码', reason: 'missing' };
+      resolve({
+        ok: !!st.ok, mode: st.ok ? 'offline' : 'none', source: st.ok ? 'offline' : 'none',
+        reason: st.reason || 'missing', msg: st.msg, appKeyConfigured: false,
+        expireAt: 0, remainDays: 0, lastOkAt: 0, deviceId: '', cloud: null,
+        offlineAvailable: !!st.ok
+      });
+    }
+  });
+}
+
+async function currentAuthState() {
+  try { return APOnlineClient ? await APOnlineClient.getStatus() : await localOfflineState(); }
+  catch (e) { return localOfflineState(); }
+}
+
 const TABS_KEY = 'apTabs';
 const ALARM_NAME = 'apWatchdog';
 const MAX_TABS = 30;
@@ -171,6 +314,72 @@ chrome.runtime.onStartup.addListener(() => ensureAlarm());
 // 内容脚本注册/注销，以及看门狗唤醒后的 ping 应答
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
+
+  // ---------- 在线授权通道 ----------
+  if (msg.type === 'apAuthState') {
+    (async () => {
+      try { await ensureSessionThrottled(false); } catch (e) {}
+      const state = await currentAuthState();
+      try { sendResponse({ ok: true, state }); } catch (e) {}
+    })();
+    return true;   // 保持通道，等待异步 sendResponse
+  }
+  if (msg.type === 'apAuthActivate') {
+    (async () => {
+      let res;
+      try {
+        res = APOnlineClient ? await APOnlineClient.activate(msg.code)
+          : { ok: false, msg: '在线授权模块未加载' };
+      } catch (e) { res = { ok: false, msg: '激活异常：' + ((e && e.message) || e) }; }
+      if (res && res.ok) {
+        const st = res.state || await currentAuthState();
+        // 只有在线卡密才需要 5 秒心跳通道；AVP1 离线码是本地凭证，不常驻离屏文档
+        if (st && st.source === 'online') {
+          try { await ensureOffscreen(); } catch (e) {}
+          try { await onHeartbeatTick(); } catch (e) {}
+        }
+        broadcastAuth(st);
+      }
+      try {
+        sendResponse({ ok: !!(res && res.ok), msg: (res && res.msg) || '',
+          reason: (res && res.reason) || '', state: (res && res.state) || await currentAuthState() });
+      } catch (e) {}
+    })();
+    return true;
+  }
+  if (msg.type === 'apAuthClear') {
+    (async () => {
+      let state = null;
+      try {
+        if (APOnlineClient) await APOnlineClient.clear();
+        else if (chrome.storage && chrome.storage.sync) chrome.storage.sync.set({ licenseKey: '' });
+        state = await currentAuthState();
+        broadcastAuth(state);
+      } catch (e) {}
+      try { sendResponse({ ok: true, state }); } catch (e) {}
+    })();
+    return true;
+  }
+  if (msg.type === 'apAuthRefresh') {
+    (async () => {
+      try { await ensureSessionThrottled(true); } catch (e) {}
+      const state = await currentAuthState();
+      broadcastAuth(state);
+      try { sendResponse({ ok: true, state }); } catch (e) {}
+    })();
+    return true;
+  }
+  if (msg.type === 'apAuthTrial') {
+    (async () => {
+      let res;
+      try { res = APOnlineClient ? await APOnlineClient.trial() : { ok: false, msg: '在线授权模块未加载' }; }
+      catch (e) { res = { ok: false, msg: '试用异常：' + ((e && e.message) || e) }; }
+      if (res && res.ok) { try { await ensureOffscreen(); } catch (e) {} broadcastAuth(res.state || await currentAuthState()); }
+      try { sendResponse({ ok: !!(res && res.ok), msg: (res && res.msg) || '', state: (res && res.state) || await currentAuthState() }); } catch (e) {}
+    })();
+    return true;
+  }
+
   if (msg.type === 'apRegister') {
     ensureAlarm();
     if (sender.tab) addTab(sender.tab.id);
@@ -201,6 +410,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (!alarm || alarm.name !== ALARM_NAME) return;
+  // 授权兜底：Service Worker 曾被回收 / 离屏文档被关闭时补建并补一次心跳。
+  // 每分钟闹钟与 5 秒 Worker 节拍互为冗余，任一存活都能维持在线状态。
+  (async () => {
+    try {
+      if (!APOnlineClient) return;
+      const s = await APOnlineClient.loadState();
+      if (s && s.token) { await ensureOffscreen(); await onHeartbeatTick(); }
+    } catch (e) {}
+  })();
   readTabs((list) => {
     list.forEach((entry) => {
       if (!entry || entry.id == null) return;
@@ -219,3 +437,29 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     });
   });
 });
+
+// 离屏文档通过 runtime.Port 每 5 秒敲一次；Port 是点对点的，
+// 不会像 sendMessage 那样把节拍广播给所有标签页/iframe。
+try {
+  chrome.runtime.onConnect.addListener((port) => {
+    if (!port || port.name !== 'apHeartbeat') return;
+    try {
+      port.onMessage.addListener((m) => {
+        if (m && m.type === 'apHeartbeatTick') onHeartbeatTick();
+      });
+    } catch (e) {}
+  });
+} catch (e) {}
+
+// Service Worker 每次被唤醒都做一次轻量恢复：已激活则确保心跳通道存在，
+// 未激活则只校验本地状态，不产生任何网络请求。
+setTimeout(() => {
+  (async () => {
+    try {
+      if (!APOnlineClient) return;
+      const s = await APOnlineClient.loadState();
+      if (s && s.token) { await ensureOffscreen(); await onHeartbeatTick(); }
+      else await currentAuthState();
+    } catch (e) {}
+  })();
+}, 0);

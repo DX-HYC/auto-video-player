@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!--
+  自动连播助手 (Auto Video Player) · 离屏心跳宿主
+  Copyright (c) 2026 胡昱晨 (hu_yu_chen). Licensed under the MIT License.
+  MV3 Service Worker 会被回收、chrome.alarms 最小周期为 30 秒，无法满足授权服务端
+  "固定 5 秒心跳"。本离屏文档创建 Web Worker 承载定时器（Worker 定时器不受隐藏页面
+  节流影响），通过 runtime.Port 敲醒 Service Worker 执行真正的心跳请求。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>自动连播助手 · 授权心跳</title>
+</head>
+<body>
+  <script src="offscreen.js"></script>
+</body>
+</html>

@@ -64,15 +64,86 @@
 
 ## 商业授权（作者必读）
 
-本插件采用**离线授权码**机制：没有有效授权时，插件在网页上完全不工作（不扫描、不起播、不自动下一集），只在页面右下角显示「🔒 插件未授权」卡片，需联系作者获取授权码。
+v2.2.1 起采用**双授权并存**：在线卡密（主通道）+ 旧版离线码（独立凭证），两套互不干扰。没有有效授权时插件**完全不工作**（不扫描、不起播、不自动下一集、不建面板），只在右下角显示「🔒 插件未授权」卡片，提示联系作者（QQ 2657449167 · 微信 Evil_Hu123456）。
 
-授权为**程序级授权**（v2.1.1 起）：不绑定域名、不绑定平台——授权码只证明"该用户有权使用本程序"，激活后**全部功能、全部已支持网站**均可使用。
+授权仍是**程序级**：不绑定域名、不绑定平台，激活后全部功能、全部已支持网站可用。
 
-**用户激活（两种方式任选）：**
-1. 打开任意已支持的学习网站，页面右下角「🔒 插件未授权」卡片里粘贴授权码 → 点「激活」；
-2. 点浏览器工具栏扩展图标，在弹窗顶部的授权卡里输入激活。
+### 两套授权怎么共存
 
-授权码保存在 `chrome.storage.sync`，随 Chrome/Edge 账号同步，换电脑登录同一账号无需再次激活。
+| | 在线卡密 | 旧版离线码（AVP1 开头） |
+| --- | --- | --- |
+| 签发 | 授权系统后台 | `tools/gen-license.js` 本地签发 |
+| 联网 | 需要（5 秒心跳） | **完全不需要** |
+| 远程停用 / 到期 | 生效（403 / 410 立即停手） | 不受影响 |
+| 老用户升级 | — | **无需重签、无需重新激活、无需联网**，升级后自动继续有效 |
+
+判定规则：在线会话有效时优先按在线显示；在线失效或后台停用时，只要本机有作者签发的有效离线码就继续放行。**强制下线只对「没有离线码」的纯在线用户生效** —— 这是为了让 v2.1.x 老授权完全不受新机制影响（离线码是作者亲手签发的独立凭证，本来就不该被服务器状态摆布）。若希望后台能远程停掉某个客户，就不要给他发离线码。
+
+### AppKey 与服务器验证
+
+本版本已写入真实 AppKey（值见 `auth-online.js` 的 `CONFIG.APP_KEY`），开箱即可在线激活，分发前**不需要再填**。换软件或换服务器时用：
+
+```
+node tools/set-appkey.js --app-key SK_xxxxxxxx [--api-base https://auth.dixunblog.cn/api/v2/]
+node tools/check-online.js                       # init.php + RSA 公钥 + 设备指纹
+node tools/check-online.js --code <一张真实卡密>   # init → activate → heartbeat 全链路
+```
+
+`check-online.js` 真实打服务器，用的是与扩展完全相同的加密/签名/指纹代码。本项目已用真实卡密实测通过：**激活成功 · 剩余 30 天 · 心跳 200**，签名模式 `values`（与文档「安全机制」章节一致，Python 示例的 `key=value` 写法无需启用）。改 AppKey、密钥或接口地址后必须重跑并重新打包。
+
+### 买家激活
+
+打开任一已支持的学习网站 → 右下角卡片粘贴授权码点「激活」；或点工具栏扩展图标，在弹窗顶部输入。**两种码共用一个输入框**。激活后立即生效、无需刷新。
+
+在线会话（JWT / 刷新令牌 / 设备指纹）存在 `chrome.storage.local`，**不随 Chrome 账号同步**：换设备需重新激活，设备数由后台控制。旧版离线码仍存在 `chrome.storage.sync.licenseKey`、随账号同步，行为与 v2.1.x 完全一致。弹窗「清除本机授权」会同时移除两者。
+
+### 在线状态与断网宽限
+
+- 固定 **5 秒心跳**：offscreen 文档里的 Web Worker 驱动，不受后台标签页节流影响；连续约 15 秒无心跳服务端判离线。**纯离线码用户不会创建离屏文档、不发任何网络请求**。
+- 网络抖动给 **5 分钟宽限**，期间插件继续工作并显示「宽限中」；超时停手并提示检查网络（有离线码则继续可用）。
+- 后台「到期 410 / 强制下线 403」：纯在线用户立即停手；持有有效离线码的用户按上表继续放行。
+- JWT 24 小时有效，临近过期自动走 `refresh.php`；若长时间不开浏览器错过刷新窗口，需重新输一次卡密。
+
+### 旧版离线码（继续可用）
+
+服务器宕机、买家长期断网，或给老客户续签离线授权时：
+
+```
+node tools/gen-license.js --days 365 --customer CUST-001
+node tools/gen-license.js --forever --customer 张三
+```
+
+在网页卡片或弹窗输入 `AVP1-…` 码即可本地验签激活；后台 Service Worker 暂不可达时也能激活。**已签发的旧码全部继续有效，不需要重签**。
+
+### 服务端加固（作者侧，不随扩展分发）
+
+线上 `docs/api.php` 曾把 `CLIENT_SECRET` 明文写在公开页面里。加固包在项目外的
+独立目录 `../server-hardening/`（交付件 `docs-access-control.zip`），内含：
+
+1. Nginx 目录密码方案（推荐，宝塔面板约 2 分钟）与手写配置片段；
+2. 仅 FTP 权限时用的 PHP 守卫（fail-closed + bcrypt + 限流 + 安全响应头）；
+3. curl 验证命令、部署后自检清单；
+4. `CLIENT_SECRET` 轮换清单（**必须做**：密钥已公开过，加锁只是止损）。
+
+这些文件需上传到服务器执行后才会生效，**绝不打进买家扩展包**。轮换密钥用
+`node tools/set-appkey.js --client-secret '新值'`（含 `!@#$%^` 时用单引号包住），
+`--show` 只显示指纹不打印明文；服务端与扩展必须同值，并留双密钥过渡期。
+
+### 技术说明与已知限制
+
+- **客户端藏不住密钥**：签名由扩展本地计算，`auth-online.js` 里的 `CLIENT_SECRET`
+  对买家必然可见（解压扩展即可读到）。文档页加访问控制只能阻止「路人白拿」，
+  不能阻止买家逆向；防盗用靠卡密 + 设备绑定 + 后台停用与风控。
+- 服务端已于 2026-11-13 启用 SSL：`API_BASE` 固定为 `https://auth.dixunblog.cn/api/v2/`，
+  http 请求由服务器 301 跳转到 https；Basic 密码、卡密与签名参数均加密传输。
+  `manifest.json` 的 `*://auth.dixunblog.cn/*` 权限同时覆盖 http/https，CSP 未限制
+  `connect-src`，**权限与安全策略均无需改动**。v2.2.1 老包的 http 请求会随 301 自动跟随，
+  **不升级也能继续用**，但仍建议升级；离线码用户完全不受影响。
+  可选加固：给 nginx 加 HSTS 头，避免首次手输 http 地址时的降级风险。
+- WebCrypto 不支持 RSA PKCS#1 v1.5「加密」，扩展用纯 JS BigInt 手写分块加密；浏览器拿不到硬件序列号，设备指纹由扩展持久 ID + 运行环境构造，可能触发后台「设备变更待审核 423」，审核通过即可。
+- 开发文档「安全机制」写的是签名「只拼参数值」，Python SDK 示例却是 `key=value&…`。扩展默认按前者，失败时自动换后者重试并记住可用模式；也可用 `check-online.js --sign-mode kv` 强制指定。
+- 离线码的密钥在包内，挡不住专业逆向；新客户建议一律走在线卡密。
+- `tools/` 与 `tests/` 仅作者本地使用，**不随买家分发包**。
 
 ## 开发者：改动前请跑自检
 
@@ -89,7 +160,8 @@ node tests/run-all.js        # 跑完全部自检，全绿才可合入
 | `tests/selftest_customplayer.js` | 自定义播放器读数与起播（含源码级断言） |
 | `tests/selftest_autostart.js` | 首次起播行为仿真（虚拟时钟驱动真实 tick） |
 | `tests/selftest_videostate.js` | video 状态与空壳过滤 |
-| `tests/selftest_license.js` | 授权算法（SHA-256 向量 / 签名 / 程序级授权 / 过期）+ 授权闸门与待命守卫断言 |
+| `tests/selftest_license.js` | 应急离线码算法 + 授权闸门 / 待命守卫 / boot 授权守卫断言 |
+| `tests/selftest_online.js` | **在线授权行为测试**：RSA 私钥解密验签、签名自适应、激活/心跳/刷新/错误码、断网宽限状态机 |
 | `tests/selftest_robust.js` | 健壮性回归：readCustomPlayer/background 行为测试（DOM/chrome API 桩）+ 修复断言 |
 
 新增平台时的约定：在 `PLATFORMS` 里登记，用 `profileAllows(id)` 包住专属分支，并为新平台补一套自检。
@@ -102,9 +174,13 @@ node tests/run-all.js        # 跑完全部自检，全绿才可合入
 | `content.js` | 核心逻辑：视频识别、续播、列表识别、连播、悬浮面板 |
 | `content.css` | 悬浮面板样式 |
 | `popup.html` / `popup.js` | 扩展图标弹窗（设置面板） |
-| `background.js` | 后台看门狗 Service Worker（`chrome.alarms` 驱动，解决后台节流） |
-| `license.js` | 商业授权：离线授权码签发/校验（content script、popup、生成器三方共用） |
-| `tools/gen-license.js` | 授权码生成器（作者本地运行，不随买家分发） |
+| `background.js` | 后台 Service Worker：看门狗 + **在线授权总线**（激活/心跳/刷新/状态广播/离屏文档管理） |
+| `license.js` | 应急离线码签发/校验（content script、popup、生成器三方共用） |
+| `auth-online.js` | **在线授权核心**：RSA PKCS#1 v1.5、SHA-256 签名、设备指纹、5 个 API 封装、断网宽限状态机 |
+| `offscreen.html` / `offscreen.js` / `heartbeat-worker.js` | 5 秒心跳常驻通道（Web Worker + runtime.Port，规避 MV3 回收与页面节流） |
+| `tools/gen-license.js` | 应急离线码生成器（作者本地运行，不随买家分发） |
+| `tools/set-appkey.js` | 写入授权系统 AppKey / API 地址（分发前必跑） |
+| `tools/check-online.js` | 真实服务器连通性与加密/签名/激活/心跳自检（分发前必跑） |
 | `icons/` | 扩展图标 |
 | `LICENSE` | MIT 许可证全文 |
 | `NOTICE` | 知识产权与著作权声明（中英双语） |

@@ -121,47 +121,86 @@
   }
 
   // ==========================================================================
-  // 商业授权闸门（v2.1.0，v2.1.1 起为程序级授权：不绑定域名/平台）
-  // 未授权 → 插件完全不工作：不扫描、不起播、不建面板、不注册看门狗，
-  // 只在页面上给出联系作者获取授权的提示卡。授权码的签发/校验在 license.js
-  // （APLicense），此处只负责"拿码 → 判定 → 放行或拦下"。
+  // 商业授权闸门（v2.2.0：在线卡密为主 + 应急离线码兜底）
+  // 最终判定统一由 background.js 的在线授权总线给出（token / 5 秒心跳 / 断网宽限
+  // 都在那里）；本文件只负责"拿状态 → 放行或拦下"。SW 暂不可达时读本地缓存降级，
+  // 避免扩展刚升级/后台重启时把已付费用户误判为未授权。
+  // 未授权 → 不扫描、不起播、不建面板、不注册看门狗，只显示联系作者的卡片。
   // ==========================================================================
-  function verifyCurrentLicense() {
-    if (typeof APLicense === 'undefined' || !APLicense || typeof APLicense.verifyLicense !== 'function') {
-      // license.js 未被注入（异常情况）：按未授权处理，商业策略不因缺文件而失效
-      return { ok: false, reason: 'missing', msg: '授权模块加载失败' };
+  const AUTH_GRACE_MS = 5 * 60 * 1000;
+  let wasAuthorized = false;
+
+  function offlineState() {
+    const st = (typeof APLicense !== 'undefined' && APLicense && APLicense.verifyLicense)
+      ? APLicense.verifyLicense(licenseKey, '', Date.now())
+      : { ok: false, reason: 'missing', msg: '授权模块加载失败' };
+    if (st.ok) {
+      return { ok: true, mode: 'offline', source: 'offline', reason: 'ok',
+        msg: '旧版离线授权有效（无需联网） · ' + st.msg, appKeyConfigured: true };
     }
-    // 程序级授权（v2.1.1）：不传域名，任何网站同一授权码均有效
-    return APLicense.verifyLicense(licenseKey, '', Date.now());
+    return { ok: false, mode: 'none', source: 'none', reason: st.reason || 'missing', msg: st.msg,
+      appKeyConfigured: true };
+  }
+
+  // SW 无响应时的降级判定：最近成功心跳仍在宽限内 → 视为有效（不打断播放）
+  function localFallbackState(cb) {
+    try {
+      chrome.storage.local.get({ apOnlineState: {} }, (r) => {
+        const s = (r && r.apOnlineState) || {};
+        if (s.token && !s.revoked && s.lastOkAt && Date.now() - s.lastOkAt <= AUTH_GRACE_MS) {
+          cb({ ok: true, mode: 'grace', source: 'online', reason: 'ok',
+            msg: '授权有效 · 后台服务恢复中', appKeyConfigured: true });
+          return;
+        }
+        cb(offlineState());
+      });
+    } catch (e) { cb(offlineState()); }
+  }
+
+  function queryAuthState(cb) {
+    let settled = false;
+    const finish = (st) => { if (settled) return; settled = true; cb(st); };
+    try {
+      chrome.runtime.sendMessage({ type: 'apAuthState' }, (res) => {
+        void chrome.runtime.lastError;
+        if (res && res.state) return finish(res.state);
+        localFallbackState(finish);
+      });
+    } catch (e) { localFallbackState(finish); }
+    // SW 长时间无响应：不再无限等待，按本地缓存判定。老离线码用户本地即可放行，
+    // 因此上限压到 6 秒，避免后台重启时把已付费用户晾太久。
+    setTimeout(() => { if (!settled) localFallbackState(finish); }, 6000);
   }
 
   function checkLicense(cb) {
-    try {
-      chrome.storage.sync.get({ licenseKey: '' }, (res) => {
-        const v = (res && typeof res.licenseKey === 'string') ? res.licenseKey : '';
-        if (v) licenseKey = v;
-        licenseState = verifyCurrentLicense();
-        if (cb) cb();
-      });
-    } catch (e) {
-      licenseState = verifyCurrentLicense();
+    queryAuthState((st) => {
+      if (st) licenseState = st;
       if (cb) cb();
+    });
+  }
+
+  // 状态应用（后台广播 / 应急码变化 / 重新查询共用）
+  function applyAuthState(st) {
+    if (st) licenseState = st;
+    const state = licenseState || offlineState();
+    if (state.ok) {
+      hideLicenseOverlay();
+      if (!wasAuthorized) {
+        wasAuthorized = true;
+        log('授权已生效：' + state.msg);
+        if (!fullStarted) boot();
+      }
+      return;
     }
+    wasAuthorized = false;
+    log('授权未生效：' + state.msg);
+    if (fullStarted) enterStandby('授权失效');
+    showLicenseOverlay();
   }
 
   // 授权码在 popup / 其他标签页被激活或清除后的重新判定
   function recheckLicense() {
-    const prevOk = !!(licenseState && licenseState.ok);
-    licenseState = verifyCurrentLicense();
-    if (licenseState.ok) {
-      hideLicenseOverlay();
-      if (!prevOk && !fullStarted) { log('授权已生效：' + licenseState.msg); boot(); }
-      return;
-    }
-    // 授权被清除 / 变为无效：立刻停手并提示（没有授权就无法使用）
-    log('授权已失效：' + licenseState.msg);
-    if (fullStarted) enterStandby('授权失效');
-    showLicenseOverlay();
+    queryAuthState((st) => applyAuthState(st));
   }
 
   function licenseAuthor() {
@@ -169,13 +208,33 @@
       ? APLicense.AUTHOR : { name: '', contact: '' };
   }
 
-  function showLicenseOverlay() {
-    if (!IS_TOP) return;
-    hideLicenseOverlay();
-    const st = licenseState || { ok: false, msg: '未授权' };
+  function licenseReason(st, override) {
+    if (override) return override;
     const author = licenseAuthor();
-    const reason = (typeof APLicense !== 'undefined' && APLicense.reasonText)
-      ? APLicense.reasonText(st) : ('未授权，' + (author.contact || '请联系作者获取授权'));
+    let msg = (st && st.msg) || '未授权：请输入授权码';
+    if (st && st.ok) return msg;
+    const contact = (author.name || '作者') + (author.contact ? '（' + author.contact + '）' : '');
+    if (msg.indexOf('联系') < 0) msg += '，请联系 ' + contact + ' 获取授权';
+    return msg;
+  }
+
+  function updateLicenseCard(text, busy) {
+    const card = document.getElementById('ap-license-card');
+    if (!card) { showLicenseOverlay(text); return; }
+    const r = card.querySelector('.ap-lic-reason');
+    if (r) r.textContent = text;
+    const btn = card.querySelector('#ap-lic-btn');
+    if (btn) { btn.textContent = busy ? '处理中…' : '激活'; btn.disabled = !!busy; }
+  }
+
+  function showLicenseOverlay(reasonOverride) {
+    if (!IS_TOP) return;
+    const st = licenseState || offlineState();
+    const reason = licenseReason(st, reasonOverride);
+    // 卡片已存在时只更新文字，避免失败重试把用户粘贴的授权码清空
+    if (document.getElementById('ap-license-card')) { updateLicenseCard(reason, false); return; }
+    hideLicenseOverlay();
+    const author = licenseAuthor();
     const card = document.createElement('div');
     card.id = 'ap-license-card';
     // 标记为扩展自有元素：页面级扫描（找下一集按钮/播放按钮/目录）必须跳过它
@@ -186,14 +245,14 @@
       '<div class="ap-lic-author">作者：' + escapeHtml(author.name || '') +
         (author.contact ? '<br>联系方式：' + escapeHtml(author.contact) : '') + '</div>' +
       '<div class="ap-lic-row">' +
-        '<input class="ap-lic-input" id="ap-lic-input" type="text" placeholder="粘贴授权码（空格/连字符均可）" spellcheck="false">' +
+        '<input class="ap-lic-input" id="ap-lic-input" type="text" placeholder="在线卡密 / 旧版离线码（AVP1 开头）均可" spellcheck="false">' +
         '<button class="ap-lic-btn" id="ap-lic-btn">激活</button>' +
       '</div>' +
-      '<div class="ap-lic-foot">激活成功后自动生效，无需刷新页面</div>';
+      '<div class="ap-lic-foot">两种授权均可使用：在线卡密需联网；旧版离线码无需联网，升级后自动继续有效。激活后立即生效、无需刷新。</div>';
     (document.body || document.documentElement).appendChild(card);
     const btn = card.querySelector('#ap-lic-btn');
     const input = card.querySelector('#ap-lic-input');
-    const doActivate = () => tryActivate(input ? input.value : '');
+    const doActivate = () => { tryActivate(input ? input.value : ''); };
     if (btn) btn.addEventListener('click', doActivate);
     if (input) {
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') doActivate(); });
@@ -208,23 +267,52 @@
     } catch (e) {}
   }
 
-  // 页面提示卡里输入授权码 → 校验 → 通过则写入 storage 并立即启动
+  // 页面提示卡里输入卡密 → 交给后台 activate.php 校验 → 成功后立即启动。
+  // 后台不可达且输入的是 AVP1 应急离线码时，允许本地验签兜底。
   function tryActivate(raw) {
-    const st = (typeof APLicense !== 'undefined' && APLicense.verifyLicense)
-      ? APLicense.verifyLicense(raw, '', Date.now())
-      : { ok: false, msg: '授权模块加载失败' };
-    licenseState = st;
-    if (!st.ok) {
-      log('授权码校验失败：' + st.msg);
-      showLicenseOverlay(); // 重新渲染，展示具体失败原因
-      return st;
+    const code = String(raw || '').trim();
+    if (!code) {
+      updateLicenseCard('请输入授权码');
+      return Promise.resolve({ ok: false, msg: '请输入授权码' });
     }
-    licenseKey = (typeof raw === 'string') ? raw : '';
-    try { chrome.storage.sync.set({ licenseKey: licenseKey }, () => { void chrome.runtime.lastError; }); } catch (e) {}
-    hideLicenseOverlay();
-    log('授权通过：' + st.msg);
-    if (!fullStarted) boot();
-    return st;
+    updateLicenseCard('正在连接授权服务器，请稍候…', true);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (res) => {
+        if (done) return;
+        done = true;
+        if (res && res.ok) {
+          applyAuthState(res.state || {
+            ok: true, mode: 'online', source: 'online', reason: 'ok',
+            msg: res.msg || '授权已生效', appKeyConfigured: true
+          });
+          resolve(res);
+          return;
+        }
+        // 应急离线码：即使后台暂时不可用也要能激活
+        if (code.toUpperCase().indexOf('AVP1') === 0 &&
+            typeof APLicense !== 'undefined' && APLicense && APLicense.verifyLicense) {
+          const local = APLicense.verifyLicense(code, '', Date.now());
+          if (local.ok) {
+            licenseKey = code;
+            try { chrome.storage.sync.set({ licenseKey: code }, () => { void chrome.runtime.lastError; }); } catch (e) {}
+            applyAuthState(offlineState());
+            resolve({ ok: true, msg: '应急离线授权已生效' });
+            return;
+          }
+        }
+        const msg = (res && res.msg) || '激活失败，请稍后重试';
+        updateLicenseCard(msg, false);
+        resolve(res || { ok: false, msg: msg });
+      };
+      try {
+        chrome.runtime.sendMessage({ type: 'apAuthActivate', code: code }, (res) => {
+          void chrome.runtime.lastError;
+          finish(res || null);
+        });
+      } catch (e) { finish(null); }
+      setTimeout(() => finish({ ok: false, msg: '激活超时，请检查网络后重试' }), 25000);
+    });
   }
 
   // ==========================================================================
@@ -266,6 +354,8 @@
   }
 
   function boot() {
+    // 授权闸门：待命观察器 / 定时器 / 广播都不得绕过它启动完整功能
+    if (!licenseState || !licenseState.ok) return;
     if (fullStarted) return;
     if (hasPlaybackHints()) { startFull(); return; }
     startProbe();
@@ -3387,6 +3477,11 @@
 
   try {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      if (msg && msg.type === 'apAuthChanged') {
+        // 后台心跳/激活/强制下线导致的状态变化：立即放行或停手
+        applyAuthState(msg.state);
+        return false;
+      }
       if (msg && msg.type === 'apWatchdog') {
         // 待命期间不响应看门狗：没有播放内容的页面不应被反复唤醒扫描
         if (!fullStarted) return false;
@@ -3450,6 +3545,9 @@
   // 完整启动（授权通过 + 有播放内容特征时才走到这里）
   function startFull() {
     if (fullStarted) return;
+    // v2.2.0 安全修复：待命观察器在"授权被清除/后台强制下线"后仍可能触发
+    // startFull()，此前没有授权守卫，会绕过授权闸门直接恢复完整自动化。
+    if (!licenseState || !licenseState.ok) return;
     fullStarted = true;
     // 待命观察器已完成使命（唤醒了本次启动）：断开它，避免与 observe() 的主观察器
     // 重复触发同一批扫描（v2.1.2 修复：此前唤醒后 probeMo 一直挂着）

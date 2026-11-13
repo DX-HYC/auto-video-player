@@ -1,5 +1,89 @@
 # 更新日志
 
+### v2.2.2（2026-11-13）授权站启用 SSL，在线通道全面切到 https
+
+**服务端已配置有效证书**（实测 `ssl_verify=0`）：`docs/api.php`、`admin/login.php`
+返回 200，`init.php` 的 HTTPS POST 正常返回 RSA 公钥，http 已 301 跳转到 https。
+
+- `auth-online.js`：`API_BASE` 由 `http://` 改为 `https://auth.dixunblog.cn/api/v2/`；
+  注释里的接口地址同步。激活、心跳、刷新、试用等子请求都基于该常量，一处改动全覆盖。
+- `manifest.json`：版本 2.2.2。`host_permissions` 原本就是 `*://auth.dixunblog.cn/*`，
+  同时覆盖 http/https；CSP 未限制 `connect-src`，**权限与 CSP 均无需改动**。
+- `tools/check-online.js`：网络失败排查建议改为证书 / 301 / https 地址检查。
+- `tests/selftest_online.js`：新增源码级门禁断言「API_BASE 必须以 https:// 开头」，
+  防止以后误退回明文；`tests/selftest_license.js` 版本断言同步 2.2.2。
+- `README.md`：更新安全须知。老包（v2.2.1）的 http 请求会被 301 自动跟随，
+  **不升级也不会立刻失效**，持 `AVP1` 离线码的用户完全不受影响。
+- 服务端加固包 `server-hardening/`：curl 验证命令全部改为 https，SSL 状态改为已完成，
+  补充 HSTS 建议；`docs-access-control.zip` 同步重打。
+
+**验证**：`node tools/check-online.js` 走真实 https 取公钥成功；`node tests/run-all.js`
+全绿；证书链、301 跳转、接口返回均实测通过。
+
+### v2.2.1（2026-11-12）填入真实 AppKey + 真实服务器验证 + 双授权兼容加固
+
+**真实服务器端到端验证通过**：填入后台 AppKey 后用真实卡密跑通
+`init.php → activate.php → heartbeat.php`，返回「激活成功 · 剩余 30 天」、心跳 200，
+签名模式 `values`（与文档「安全机制」章节一致，无需启用 Python 示例的 `key=value` 写法）。
+v2.2.0 包里是占位 AppKey，本版为**首个可直接分发的在线授权版本**。
+
+**双授权兼容（用户要求：原来的授权不受影响）**
+- `auth-online.js` 的 `computeStatus()` 改为：在线会话有效时优先按在线显示；其余情况
+  只要本机有作者签发的有效 `AVP1` 离线码就**独立放行**，不受在线会话过期、断网宽限、
+  后台 403/410 停用或到期影响。v2.1.x 老用户升级后**无需重签、无需重新激活、无需联网**。
+  强制下线仅对「没有离线码」的纯在线用户生效 —— 离线码是作者亲手签发的独立凭证。
+- `background.js`：离线码激活不再创建离屏文档；`onHeartbeatTick()` 在无线上令牌时
+  提前收手并关闭离屏文档，纯离线码用户不会被 5 秒节拍无谓唤醒，也不发任何网络请求。
+- `popup.js`：后台 SW 暂不可达时，输入 `AVP1` 码仍可本地验签激活（与网页卡片一致）。
+- `content.js`：SW 无响应的降级等待由 15 秒压到 6 秒；未授权卡片、弹窗文案改为明确
+  列出两种授权，说明旧码无需联网、升级后自动继续有效。
+
+**测试**：新增 17 项兼容断言（老用户升级零请求、离线码跨 revoked/session-lost、
+在线优先、popup 本地兜底、真实 AppKey 已写入等），全量回归 **287/287 通过**。
+
+### v2.2.0（2026-11-12）接入 V2 在线授权系统（在线卡密 + 应急离线码）
+
+主授权通道改为作者自建的 `auth.dixunblog.cn/api/v2/` 在线授权系统：`init / activate /
+heartbeat / refresh` 五个接口，RSA-2048 加密传输、SHA-256 签名、JWT 令牌、5 秒心跳、
+后台可远程停用。授权仍为**程序级**（不绑定域名/平台），激活后全功能全站可用。
+原离线授权码保留为**应急备用通道**（服务器宕机/断网时本地验签生效）。
+
+**接入要点**
+- 新增 `auth-online.js`：纯 JS BigInt 实现 RSAES-PKCS1-v1_5 分块加密（WebCrypto 不
+  支持 v1.5 加密，只支持 OAEP）；浏览器无硬件序列号，用扩展持久设备 ID + 运行环境
+  构造满足文档格式（≥3 个 64 位 hex 组件）的指纹；封装 5 个接口与状态机。
+- 开发文档「安全机制」（只拼参数值）与 Python SDK 示例（`key=value&…`）签名写法矛盾：
+  默认按前者，激活失败自动换后者重试并记住可用模式；`check-online.js --sign-mode kv`
+  可强制指定。
+- 新增 `offscreen.html/js` + `heartbeat-worker.js`：MV3 Service Worker 会被回收、
+  `chrome.alarms` 最小 30 秒，用离屏文档里的 Web Worker 承载 5 秒节拍，经
+  `runtime.Port` 点对点唤醒 SW 执行心跳（不广播给所有标签页），每分钟闹钟兜底重建。
+- `background.js` 新增授权消息总线（`apAuthState / apAuthActivate / apAuthClear /
+  apAuthRefresh / apAuthTrial`），所有网络请求由 SW 发起 —— content script 在 https
+  学习页里 fetch http 会被混合内容策略拦截。状态单点存 `storage.local`，变化时广播
+  `apAuthChanged`，相同状态不发消息（避免 5 秒一次的消息风暴）。
+- `content.js` / `popup.js` 授权闸门改为向后台查询 + 订阅广播；SW 不可达时读本地缓存
+  降级（最近心跳在宽限内继续可用），应急离线码可本地验签兜底。
+- 断网宽限 5 分钟；后台「到期 410 / 强制下线 403」立即停手且**不回落应急码**；
+  JWT 临近过期自动 `refresh.php`；心跳 401 自动刷新后重试。
+
+**顺带修复的安全漏洞**
+- `boot()` / `startFull()` 原先没有授权守卫：待命观察器在授权被清除后仍可能唤醒完整
+  启动，绕过授权闸门。现在两处都加了状态检查。
+
+**作者工具（不随买家分发）**
+- `tools/set-appkey.js`：写入授权系统 AppKey / API 地址（**分发前必跑**）。
+- `tools/check-online.js`：真实服务器连通性与端到端自检（init → activate → heartbeat）。
+- `tools/gen-license.js`：保留，用于签发应急离线码。
+
+**manifest**：版本 2.2.0；新增 `offscreen` 权限与 `auth.dixunblog.cn` host 权限。
+**测试**：新增 `tests/selftest_online.js`（81 项，含 Node RSA 私钥解密验证密文、签名
+自适应、错误码、宽限状态机），全量门禁 **269/269 通过**。
+
+**待办**：作者需填入真实 AppKey 并用一张真实卡密跑 `check-online.js --code` 做真实
+服务器端到端验证；建议给开发文档加访问控制、给服务器配置 SSL（当前仅 http，
+`CLIENT_SECRET` 明文暴露在文档页）。
+
 ### v2.1.2（2026-10-27）全栈体检：5 个 bug 修复 + 性能优化
 
 对全部源码（manifest / background / content / popup / license / shadow_bridge，约 4900 行）

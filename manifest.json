@@ -1,14 +1,18 @@
 {
   "manifest_version": 3,
   "name": "自动连播助手",
-  "version": "2.1.2",
+  "version": "2.2.2",
   "author": "胡昱晨 (hu_yu_chen)",
   "description": "© 2026 胡昱晨 (hu_yu_chen) 原创作品，保留所有权利｜自动识别网页视频与播放列表：暂停自动续播、播完自动下一集、支持倍速。MIT 授权，禁止删除署名或冒称原创。",
-  "permissions": ["storage", "alarms", "scripting"],
+  "permissions": ["storage", "alarms", "scripting", "offscreen"],
   "background": {
     "service_worker": "background.js"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; worker-src 'self'"
+  },
   "host_permissions": [
+    "*://auth.dixunblog.cn/*",
     "*://*.webtrn.cn/*",
     "*://*.jxnu.edu.cn/*",
     "*://*.bilibili.com/*",

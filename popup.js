@@ -43,67 +43,148 @@ const CHECK_KEYS = ['enabled', 'autoStart', 'autoResume', 'autoNext', 'speedEnab
 
 const platState = {};
 
-// ---------- 授权 ----------
-// 与 content.js 共用 license.js。v2.1.1 起授权为程序级（不绑定域名/平台），
-// popup 里的校验即最终校验：签名 + 有效期 + 客户号，通过后全部功能可用。
+// ---------- 授权（v2.2.0：在线卡密为主 + 应急离线码兜底） ----------
+// 状态一律向 background.js 查询：JWT / 5 秒心跳 / 断网宽限都在后台单点管理，
+// 弹窗只负责展示与发起激活。license.js 仍用于作者信息、日期格式化与应急码验签。
 const licBox = document.getElementById('licBox');
 const licStatus = document.getElementById('licStatus');
 const licInput = document.getElementById('licInput');
 const licMeta = document.getElementById('licMeta');
 
-function renderLicense(state, rawKey) {
-  const author = (typeof APLicense !== 'undefined' && APLicense.AUTHOR) ? APLicense.AUTHOR : { name: '', contact: '' };
-  if (state && state.ok) {
+function authorText() {
+  const a = (typeof APLicense !== 'undefined' && APLicense && APLicense.AUTHOR) ? APLicense.AUTHOR : { name: '', contact: '' };
+  return (a.name || '作者') + (a.contact ? ' · ' + a.contact : '');
+}
+
+function fmtExpire(ms) {
+  if (!ms) return '永久 / 未知';
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+
+function renderLicense(state, note) {
+  const st = state || { ok: false, mode: 'none', msg: '未授权：请输入授权卡密' };
+  if (st.ok) {
     licBox.classList.add('ok');
-    licStatus.textContent = '✅ ' + state.msg;
-    const p = state.payload || {};
-    let detail = '授权信息：';
-    if (p.c) detail += '客户 ' + p.c + ' · ';
-    detail += '程序级授权（全部功能 · 全部已支持网站） · ';
-    detail += (p.x ? '到期 ' + APLicense.fmtDate(p.x) : '永久有效');
-    licMeta.innerHTML = escapeHtml(detail) +
-      '<br>更换设备/浏览器时，用同一授权码再次激活即可（设置随 chrome 账号同步）。' +
-      '<br><button class="lic-clear" id="licClear">清除本机授权</button>';
+    const icon = st.mode === 'grace' ? '⚠️' : (st.mode === 'offline' ? '🔑' : '✅');
+    licStatus.textContent = icon + ' ' + (st.msg || '授权有效');
+    let detail = '授权来源：' +
+      (st.mode === 'offline' ? '旧版离线码（无需联网，升级后继续有效）' : (st.mode === 'grace' ? '在线（断网宽限中）' : '在线卡密（已连接服务器）'));
+    if (st.expireAt) detail += '<br>到期：' + fmtExpire(st.expireAt);
+    if (st.remainDays) detail += '<br>剩余：约 ' + st.remainDays + ' 天';
+    if (st.deviceId) detail += '<br>设备码：' + escapeHtml(String(st.deviceId).slice(0, 12));
+    detail += '<br>程序级授权：全部功能 · 全部已支持网站';
+    detail += '<br>清除本机授权会同时移除在线卡密与旧版离线码';
+    if (st.cloud && st.cloud.announcements && st.cloud.announcements.length) {
+      const a = st.cloud.announcements[0];
+      detail += '<br>服务器公告：' + escapeHtml(a.title || '');
+    }
+    licMeta.innerHTML = detail +
+      '<br><button class="lic-clear" id="licRefresh">重新检测</button> ' +
+      '<button class="lic-clear" id="licClear">清除本机授权</button>';
+    const refresh = document.getElementById('licRefresh');
+    if (refresh) refresh.addEventListener('click', () => {
+      licStatus.textContent = '正在重新连接授权服务器…';
+      chrome.runtime.sendMessage({ type: 'apAuthRefresh' }, (res) => {
+        void chrome.runtime.lastError;
+        renderLicense(res && res.state ? res.state : st, '');
+      });
+    });
     const clear = document.getElementById('licClear');
     if (clear) clear.addEventListener('click', () => {
-      chrome.storage.sync.set({ licenseKey: '' }, () => {
+      chrome.runtime.sendMessage({ type: 'apAuthClear' }, () => {
+        void chrome.runtime.lastError;
         licInput.value = '';
         loadLicense();
       });
     });
   } else {
     licBox.classList.remove('ok');
-    const reason = (typeof APLicense !== 'undefined' && APLicense.reasonText) ? APLicense.reasonText(state) : '未授权';
-    licStatus.textContent = '🔒 ' + reason;
+    let msg = st.msg || '未授权：请输入授权卡密';
+    if (msg.indexOf('联系') < 0) msg += '，请联系 ' + authorText() + ' 获取授权';
+    licStatus.textContent = '🔒 ' + msg;
     licMeta.innerHTML = '未授权时插件<strong>不会工作</strong>：不会自动播放、不会自动下一集。' +
-      '<br>请联系作者购买授权并获取授权码：<b>' + escapeHtml(author.name || '') +
-      (author.contact ? ' · ' + escapeHtml(author.contact) : '') + '</b>' +
-      '<br>授权为程序级：不绑定网站，激活后全部功能可用；随 chrome 账号同步，换电脑登录同一账号即可。';
+      '<br>购买请联系 <b>' + escapeHtml(authorText()) + '</b>' +
+      '<br>两种授权均可使用：<b>在线卡密</b>由后台签发（需联网），<b>旧版离线码</b>以 AVP1 开头（无需联网，升级后自动继续有效）。' +
+      (st.appKeyConfigured === false ? '<br>⚠️ 本版本尚未配置 AppKey，请联系作者获取可激活版本。' : '');
   }
-  if (rawKey && !state.ok) licInput.value = rawKey;
+  if (note) licStatus.textContent += '（' + note + '）';
 }
 
-function loadLicense() {
-  chrome.storage.sync.get({ licenseKey: '' }, (s) => {
-    const raw = (s && typeof s.licenseKey === 'string') ? s.licenseKey : '';
-    const st = (typeof APLicense !== 'undefined')
-      ? APLicense.verifyLicense(raw, '', Date.now())   // 程序级授权：不传域名
-      : { ok: false, msg: '授权模块加载失败' };
-    renderLicense(st, '');
+function localLicenseState() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.sync.get({ licenseKey: '' }, (r) => {
+        const raw = (r && r.licenseKey) || '';
+        const st = (raw && typeof APLicense !== 'undefined')
+          ? APLicense.verifyLicense(raw, '', Date.now())
+          : { ok: false, msg: '后台服务暂不可用，请稍后重试' };
+        resolve(st.ok
+          ? { ok: true, mode: 'offline', source: 'offline', reason: 'ok', msg: '旧版离线授权有效（无需联网） · ' + st.msg, appKeyConfigured: true }
+          : { ok: false, mode: 'none', source: 'none', reason: 'missing', msg: st.msg, appKeyConfigured: true });
+      });
+    } catch (e) {
+      resolve({ ok: false, mode: 'none', msg: '后台服务暂不可用，请稍后重试', appKeyConfigured: true });
+    }
   });
+}
+
+function loadLicense(note) {
+  try {
+    chrome.runtime.sendMessage({ type: 'apAuthState' }, async (res) => {
+      void chrome.runtime.lastError;
+      renderLicense(res && res.state ? res.state : await localLicenseState(), note);
+    });
+  } catch (e) { localLicenseState().then(st => renderLicense(st, note)); }
 }
 
 document.getElementById('licActivate').addEventListener('click', () => {
-  const raw = licInput.value;
-  const st = (typeof APLicense !== 'undefined')
-    ? APLicense.verifyLicense(raw, '', Date.now())
-    : { ok: false, msg: '授权模块加载失败' };
-  if (!st.ok) { renderLicense(st, raw); return; }
-  chrome.storage.sync.set({ licenseKey: raw }, () => {
-    renderLicense(st, '');
-    licInput.value = '';
-  });
+  const raw = licInput.value.trim();
+  const btn = document.getElementById('licActivate');
+  if (!raw) { loadLicense('请输入授权码'); return; }
+  btn.disabled = true;
+  btn.textContent = '处理中…';
+  let done = false;
+  const finish = (res) => {
+    if (done) return;
+    done = true;
+    btn.disabled = false;
+    btn.textContent = '激活';
+    if (res && res.ok) { licInput.value = ''; loadLicense(); return; }
+    // 后台 Service Worker 暂不可达时，旧版离线码仍可本地验签激活（与网页提示卡一致）
+    if (raw.toUpperCase().indexOf('AVP1') === 0 &&
+        typeof APLicense !== 'undefined' && APLicense && APLicense.verifyLicense) {
+      const local = APLicense.verifyLicense(raw, '', Date.now());
+      if (local.ok) {
+        try {
+          chrome.storage.sync.set({ licenseKey: raw }, () => {
+            void chrome.runtime.lastError;
+            licInput.value = '';
+            loadLicense();
+          });
+        } catch (e) { loadLicense(); }
+        return;
+      }
+    }
+    loadLicense((res && res.msg) || '激活失败，请稍后重试');
+  };
+  try {
+    chrome.runtime.sendMessage({ type: 'apAuthActivate', code: raw }, (res) => {
+      void chrome.runtime.lastError;
+      finish(res || null);
+    });
+  } catch (e) { finish(null); }
+  setTimeout(() => finish({ ok: false, msg: '激活超时，请检查网络' }), 25000);
 });
+
+// 后台心跳导致的授权变化（到期 / 强制下线 / 恢复在线）实时反映到弹窗
+try {
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === 'apAuthChanged' && msg.state) renderLicense(msg.state, '');
+    return false;
+  });
+} catch (e) {}
 
 function escapeHtml(s) {
   return String(s == null ? '' : s)
