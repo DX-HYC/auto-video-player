@@ -109,6 +109,8 @@ async function stopOffscreen() {
 }
 
 let heartbeatInFlight = null;
+let lastOffscreenEnsureAt = 0;
+let lastRevokedRetryAt = 0;
 function onHeartbeatTick() {
   if (!APOnlineClient || heartbeatInFlight) return heartbeatInFlight;
   heartbeatInFlight = (async () => {
@@ -117,10 +119,27 @@ function onHeartbeatTick() {
       // 直接收手并关掉离屏文档，避免每 5 秒无谓唤醒 Service Worker。
       const s0 = await APOnlineClient.loadState();
       if (!s0 || !s0.token) { await stopOffscreen(); return; }
+
+      // v2.2.3：只要还有在线令牌，断网期间也必须保住 5 秒心跳通道。
+      // 过去只有"状态判定为 online"时才补建离屏文档；断网超时后状态变成
+      // 未授权，通道一旦被浏览器回收就再也没人去同步服务端，用户重连后
+      // 也只能重新激活。现在与状态无关地维持通道，恢复联网后自动回到在线。
+      if (Date.now() - lastOffscreenEnsureAt > 30000) {
+        lastOffscreenEnsureAt = Date.now();
+        await ensureOffscreen();
+      }
+
+      // 后台已明确停用/到期：降频重试（续费或解封后仍会自动恢复，最多等 1 分钟）
+      if (s0.revoked) {
+        if (lastRevokedRetryAt && Date.now() - lastRevokedRetryAt < 60000) return;
+        lastRevokedRetryAt = Date.now();
+      } else {
+        lastRevokedRetryAt = 0;
+      }
+
       const r = await APOnlineClient.heartbeat();
       const state = (r && r.state) || await APOnlineClient.getStatus();
       broadcastAuth(state);
-      if (state && state.source === 'online') ensureOffscreen();
     } catch (e) {}
     finally { heartbeatInFlight = null; }
   })();

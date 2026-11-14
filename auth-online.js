@@ -35,6 +35,11 @@
  *   4. refresh   POST {timestamp,nonce,sign,token,refresh_token,fingerprint}
  *   5. 错误码：401 令牌无效 / 403 强制下线 / 410 已过期 / 423 待审核 / 429 过频
  *
+ * 【v2.2.3 授权有效性原则】心跳只用于同步服务端状态，不决定授权是否可用。
+ * 用户不可能 7×24 在线：断网几小时/几天/几周，只要本地凭证仍在授权期限内、
+ * 且服务端没有明确 403/410 撤销，就一直放行；恢复联网后自动回到 online，
+ * 无需重新输入卡密。JWT 与刷新令牌都过期时，用本地保存的卡密静默重新激活。
+ *
  * 浏览器侧三个特殊处理（桌面 SDK 不需要考虑）：
  *   - WebCrypto 不支持 RSAES-PKCS1-v1_5「加密」（只支持 OAEP），这里用 BigInt 手写；
  *   - 浏览器拿不到 CPU/硬盘/MAC/主板序列号，用扩展安装 ID + 运行环境信息构造
@@ -60,8 +65,19 @@
     // 开发文档「配置」表公开的客户端密钥（服务端同值），参与 SHA-256 签名
     CLIENT_SECRET: '__CLIENT_SECRET__',
     HEARTBEAT_MS: 5000,                 // 服务端固定 5 秒
-    ONLINE_FRESH_MS: 17000,             // 17 秒内有过成功心跳 → 视为在线
-    GRACE_MS: 5 * 60 * 1000,            // 断网宽限：5 分钟内继续可用
+    ONLINE_FRESH_MS: 17000,             // 17 秒内有过成功心跳 → 显示「在线」
+    // v2.2.3：GRACE_MS 只用于区分「短暂抖动」和「长期离线」的提示文案，
+    // 不再是可用性闸门。断网时长不决定授权是否有效。
+    GRACE_MS: 5 * 60 * 1000,
+    // 授权是否可用只看两件事：本地凭证是否仍在授权期限内、服务端是否明确撤销。
+    // 服务端返回过到期时间：到期后再给 7 天联网核验窗口（容忍客户端时钟偏差 /
+    // 服务端时区差异 / 刚好在到期日前后断网），超期才停手等待联网核验。
+    EXPIRE_VERIFY_GRACE_MS: 7 * 24 * 3600 * 1000,
+    // 服务端没返回到期时间时，从最后一次成功校验起算的兜底期限（够长，
+    // 避免"未知期限"被误判成过期；联网后仍以服务端状态为准）。
+    UNKNOWN_EXPIRE_MS: 90 * 24 * 3600 * 1000,
+    // 长期断网后 JWT / refresh_token 双双过期时的静默重激活最小间隔
+    REVERIFY_MIN_MS: 5 * 60 * 1000,
     PUBLIC_KEY_TTL_MS: 12 * 3600 * 1000,
     REQUEST_TIMEOUT_MS: 12000,
     STATE_KEY: 'apOnlineState',
@@ -403,7 +419,32 @@
   }
 
   // ---------- 状态判定（纯函数，便于测试） ----------
+  /**
+   * v2.2.3：本地凭证是否仍处于授权期限内。
+   *
+   * 判定**不看距上次心跳多久**。用户不可能 7×24 在线：断网几小时、几天甚至几周，
+   * 只要服务端没有明确撤销、且本地记录的授权期限未过，授权就一直有效；
+   * 恢复联网后由心跳把服务端的停用 / 续费 / 到期状态同步回来即可。
+   */
+  function localLicenseValidity(s, now) {
+    if (!s || !s.token) return { ok: false, reason: 'notoken' };
+    if (s.revoked) return { ok: false, reason: 'revoked' };
+    if (s.expireAt > 0) {
+      if (now <= s.expireAt + CONFIG.EXPIRE_VERIFY_GRACE_MS) {
+        return { ok: true, reason: 'ok', expireAt: s.expireAt, pastExpire: now > s.expireAt };
+      }
+      return { ok: false, reason: 'expired-unverified', expireAt: s.expireAt };
+    }
+    const base = s.lastOkAt || s.activatedAt || 0;
+    // 从未记录过时间（极老的 state / 手工导入）：没有期限信息就不该误杀
+    if (!base || (now - base) <= CONFIG.UNKNOWN_EXPIRE_MS) {
+      return { ok: true, reason: 'ok', expireAt: 0, pastExpire: false };
+    }
+    return { ok: false, reason: 'unknown-expire-unverified', expireAt: 0 };
+  }
+
   function computeStatus(s, offlineResult, now) {
+    s = s || {};
     const out = {
       ok: false,
       mode: 'none',
@@ -420,30 +461,44 @@
     };
     const hasOffline = !!(offlineResult && offlineResult.ok);
 
-    // 在线会话有效时优先按在线展示（心跳新鲜 / 断网宽限内）
-    if (!s.revoked && s.token && s.lastOkAt) {
-      const age = now - s.lastOkAt;
-      if (age <= CONFIG.ONLINE_FRESH_MS) {
-        Object.assign(out, {
-          ok: true, mode: 'online', source: 'online', reason: 'ok',
-          msg: '在线授权有效' + (s.expireAt ? ' · 到期 ' + fmtDateMs(s.expireAt) : '')
-        });
-        return out;
-      }
-      if (age <= CONFIG.GRACE_MS) {
-        Object.assign(out, {
-          ok: true, mode: 'grace', source: 'online', reason: 'ok',
-          msg: '授权有效 · 暂未连上服务器（宽限中，' +
-            Math.ceil((CONFIG.GRACE_MS - age) / 60000) + ' 分钟内请恢复网络）'
-        });
-        return out;
-      }
+    // 1) 心跳新鲜 → 在线
+    if (!s.revoked && s.token && s.lastOkAt && (now - s.lastOkAt) <= CONFIG.ONLINE_FRESH_MS) {
+      Object.assign(out, {
+        ok: true, mode: 'online', source: 'online', reason: 'ok',
+        msg: '在线授权有效' + (s.expireAt ? ' · 到期 ' + fmtDateMs(s.expireAt) : '')
+      });
+      return out;
     }
 
-    // v2.2.1 兼容策略：作者签发的 AVP1 离线码是**独立凭证**。
-    // v2.1.x 老用户升级后不需要联网、不需要重新激活，也不受在线会话过期、
-    // 后台 403/410 停用或到期的影响 —— 这是"旧授权不受新机制影响"的核心保证。
-    // 纯在线用户手上没有离线码，因此后台强制下线对他们依然立即生效。
+    // 2) 断网 / 服务器不可达：只要本地凭证还在授权期限内就继续放行。
+    //    source 必须保持 'online' —— 后台据此维持 5 秒心跳通道，重连后自动恢复，
+    //    否则一旦停掉心跳就再也不会有人把服务端状态同步回来。
+    if (!s.revoked && s.token) {
+      const local = localLicenseValidity(s, now);
+      if (local.ok) {
+        const age = now - (s.lastOkAt || 0);
+        const shortBreak = age <= CONFIG.GRACE_MS;
+        Object.assign(out, {
+          ok: true,
+          mode: shortBreak ? 'grace' : 'disconnected',
+          source: 'online',
+          reason: 'ok',
+          msg: shortBreak
+            ? '授权有效 · 网络短暂中断（联网后自动恢复，无需重新激活）'
+            : '授权有效 · 当前离线，联网后自动恢复，无需重新激活' +
+              (s.expireAt ? '（到期 ' + fmtDateMs(s.expireAt) + '）' : ''),
+          awaitingReconnect: true
+        });
+        return out;
+      }
+      // 本地期限已过且一直没能联网核验：此时才需要用户介入
+      out.reason = local.reason;
+      out.msg = '授权期限已过，请联网核验或联系作者续费';
+    }
+
+    // 3) v2.2.1 兼容策略：作者签发的 AVP1 离线码是**独立凭证**。
+    //    v2.1.x 老用户升级后不需要联网、不需要重新激活，也不受在线会话过期、
+    //    后台 403/410 停用或到期的影响 —— "旧授权不受新机制影响"的核心保证。
     if (hasOffline) {
       Object.assign(out, {
         ok: true, mode: 'offline', source: 'offline', reason: 'ok',
@@ -452,15 +507,10 @@
       return out;
     }
 
-    // 后台明确禁用 / 到期：仅在没有任何有效离线码时停手
+    // 4) 后台明确禁用 / 到期：仅在没有任何有效离线码时停手
     if (s.revoked) {
       out.reason = s.revokedReason || 'revoked';
       out.msg = s.revokedMsg || '授权已被后台停用或已到期，请联系作者';
-      return out;
-    }
-    if (s.token && s.lastOkAt) {
-      out.reason = 'session-lost';
-      out.msg = '与授权服务器断开过久，请检查网络或重新激活';
     }
     return out;
   }
@@ -632,7 +682,48 @@
     return { ok: true, msg: '令牌已刷新' };
   }
 
-  /** 一次心跳。返回 { ok, state, changed }；网络失败不立即判失效，交给宽限状态机 */
+  /**
+   * v2.2.3：长期断网后 JWT（服务端 24h）与 refresh_token 可能双双过期。
+   * 旧逻辑里心跳会一直 401 → lastOkAt 永不更新 → 用户被迫重新输入卡密，
+   * 即使卡密本身还在有效期内。这里用激活时保存在本地的卡密静默重新激活一次：
+   * 服务端认可就换发新令牌，用户全程无感；失败则保持离线可用、下次再试，
+   * 只有服务端明确判「已到期 410」才撤销（停用/到期由心跳 403/410 权威同步）。
+   */
+  async function reverify() {
+    const E = env();
+    const s = await loadState();
+    const code = s.authCode;
+    if (!code || String(code).toUpperCase().indexOf('AVP1') === 0) {
+      return { ok: false, reason: 'nocode' };
+    }
+    if (!isAppKeyConfigured()) return { ok: false, reason: 'appkey' };
+    const now = E.now();
+    if (s.reverifyAt && (now - s.reverifyAt) < CONFIG.REVERIFY_MIN_MS) {
+      return { ok: false, reason: 'throttled' };
+    }
+    await saveState({ reverifyAt: now });
+    const r = await activate(code);
+    if (r && r.ok) {
+      return { ok: true, msg: '已自动恢复在线授权', state: r.state || await getStatus() };
+    }
+    const reason = (r && r.reason) || 'failed';
+    // 只有服务端明确判「授权已到期（410）」才撤销。
+    // 其余失败一律保持离线可用、下次再试：卡密可能在后台被改名/迁移/重建、
+    // 设备变更待审核 423、限流 429、验签模式或网络抖动都可能导致激活失败，
+    // 不能因为一次"补救请求"没成就把已付费用户踢下线。
+    // 真正的停用/到期由心跳的 403/410 权威同步，那条路径一直有效。
+    if (reason === 'expired') {
+      await saveState({
+        revoked: true,
+        revokedReason: 'expired',
+        revokedMsg: (r && r.msg) || '授权已到期，请联系作者续费'
+      });
+      return { ok: false, reason: 'revoked', msg: (r && r.msg) || '' };
+    }
+    return { ok: false, reason: reason, msg: (r && r.msg) || '' };
+  }
+
+  /** 一次心跳。返回 { ok, state, changed }；网络失败不立即判失效，由本地期限状态机接管 */
   async function heartbeat() {
     const E = env();
     const s = await loadState();
@@ -646,6 +737,15 @@
       if (rf.ok) {
         const s2 = await loadState();
         r = await post('heartbeat.php', signedBody({ token: s2.token }, { token: s2.token }, mode));
+      } else if (rf.code === 401 || rf.code === 403 || rf.code === 410) {
+        // 刷新令牌也过期/作废（常见于连续断网数天后）：静默重新激活，
+        // 不让用户重新输入卡密。网络类失败（code -1）不动，等下次联网即可。
+        const rv = await reverify();
+        if (rv.ok) {
+          const s3 = await loadState();
+          r = await post('heartbeat.php',
+            signedBody({ token: s3.token }, { token: s3.token }, s3.signMode || mode));
+        }
       }
     }
 
@@ -669,6 +769,7 @@
       revoked: false,
       revokedReason: '',
       revokedMsg: '',
+      reverifyAt: 0,
       cloud: d.cloud || s.cloud || null
     };
     const exp = parseExpire(d);
@@ -738,8 +839,8 @@
   return {
     CONFIG, configure, isAppKeyConfigured,
     calcSign, rsaEncryptPkcs1, parsePublicKey, buildFingerprint, deviceInfo,
-    computeStatus, sha256Hex,
-    getStatus, getPublicKey, activate, heartbeat, refresh, ensureSession, trial, clear,
+    computeStatus, localLicenseValidity, sha256Hex,
+    getStatus, getPublicKey, activate, heartbeat, refresh, reverify, ensureSession, trial, clear,
     loadState, saveState, fmtDateMs
   };
 });

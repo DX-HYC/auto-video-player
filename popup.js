@@ -44,7 +44,7 @@ const CHECK_KEYS = ['enabled', 'autoStart', 'autoResume', 'autoNext', 'speedEnab
 const platState = {};
 
 // ---------- 授权（v2.2.0：在线卡密为主 + 应急离线码兜底） ----------
-// 状态一律向 background.js 查询：JWT / 5 秒心跳 / 断网宽限都在后台单点管理，
+// 状态一律向 background.js 查询：JWT / 5 秒心跳 / 授权期限判定都在后台单点管理，
 // 弹窗只负责展示与发起激活。license.js 仍用于作者信息、日期格式化与应急码验签。
 const licBox = document.getElementById('licBox');
 const licStatus = document.getElementById('licStatus');
@@ -67,10 +67,14 @@ function renderLicense(state, note) {
   const st = state || { ok: false, mode: 'none', msg: '未授权：请输入授权卡密' };
   if (st.ok) {
     licBox.classList.add('ok');
-    const icon = st.mode === 'grace' ? '⚠️' : (st.mode === 'offline' ? '🔑' : '✅');
+    const icon = st.mode === 'disconnected' ? '📴'
+      : (st.mode === 'grace' ? '📶' : (st.mode === 'offline' ? '🔑' : '✅'));
     licStatus.textContent = icon + ' ' + (st.msg || '授权有效');
     let detail = '授权来源：' +
-      (st.mode === 'offline' ? '旧版离线码（无需联网，升级后继续有效）' : (st.mode === 'grace' ? '在线（断网宽限中）' : '在线卡密（已连接服务器）'));
+      (st.mode === 'offline' ? '旧版离线码（无需联网，升级后继续有效）'
+        : (st.mode === 'disconnected' ? '在线卡密（离线可用 · 联网后自动恢复）'
+          : (st.mode === 'grace' ? '在线卡密（短暂断线，授权仍有效）' : '在线卡密（已连接服务器）')));
+    if (st.awaitingReconnect) detail += '<br>断网不影响已激活的授权，无需重新输入卡密';
     if (st.expireAt) detail += '<br>到期：' + fmtExpire(st.expireAt);
     if (st.remainDays) detail += '<br>剩余：约 ' + st.remainDays + ' 天';
     if (st.deviceId) detail += '<br>设备码：' + escapeHtml(String(st.deviceId).slice(0, 12));
@@ -106,7 +110,7 @@ function renderLicense(state, note) {
     licStatus.textContent = '🔒 ' + msg;
     licMeta.innerHTML = '未授权时插件<strong>不会工作</strong>：不会自动播放、不会自动下一集。' +
       '<br>购买请联系 <b>' + escapeHtml(authorText()) + '</b>' +
-      '<br>两种授权均可使用：<b>在线卡密</b>由后台签发（需联网），<b>旧版离线码</b>以 AVP1 开头（无需联网，升级后自动继续有效）。' +
+      '<br>两种授权均可使用：<b>在线卡密</b>由后台签发（激活一次即可，断网不失效、联网自动恢复），<b>旧版离线码</b>以 AVP1 开头（无需联网，升级后自动继续有效）。' +
       (st.appKeyConfigured === false ? '<br>⚠️ 本版本尚未配置 AppKey，请联系作者获取可激活版本。' : '');
   }
   if (note) licStatus.textContent += '（' + note + '）';

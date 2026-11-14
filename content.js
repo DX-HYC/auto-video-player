@@ -122,12 +122,16 @@
 
   // ==========================================================================
   // 商业授权闸门（v2.2.0：在线卡密为主 + 应急离线码兜底）
-  // 最终判定统一由 background.js 的在线授权总线给出（token / 5 秒心跳 / 断网宽限
+  // 最终判定统一由 background.js 的在线授权总线给出（token / 5 秒心跳 / 服务端状态
   // 都在那里）；本文件只负责"拿状态 → 放行或拦下"。SW 暂不可达时读本地缓存降级，
   // 避免扩展刚升级/后台重启时把已付费用户误判为未授权。
+  // v2.2.3：断网时长不再决定授权是否有效 —— 只要本地凭证还在授权期限内、
+  // 且服务端没明确撤销，就一直放行，联网后由心跳自动恢复，无需重新激活。
   // 未授权 → 不扫描、不起播、不建面板、不注册看门狗，只显示联系作者的卡片。
   // ==========================================================================
-  const AUTH_GRACE_MS = 5 * 60 * 1000;
+  // 与 auth-online.js 的 EXPIRE_VERIFY_GRACE_MS / UNKNOWN_EXPIRE_MS 保持一致
+  const LOCAL_EXPIRE_VERIFY_GRACE_MS = 7 * 24 * 3600 * 1000;
+  const LOCAL_UNKNOWN_EXPIRE_MS = 90 * 24 * 3600 * 1000;
   let wasAuthorized = false;
 
   function offlineState() {
@@ -142,14 +146,29 @@
       appKeyConfigured: true };
   }
 
-  // SW 无响应时的降级判定：最近成功心跳仍在宽限内 → 视为有效（不打断播放）
+  // SW 无响应时的降级判定：与后台同一套规则 —— 本地凭证仍在授权期限内就放行，
+  // 不看距上次心跳多久。避免后台重启 / 升级瞬间把断网中的已付费用户拦下。
   function localFallbackState(cb) {
     try {
       chrome.storage.local.get({ apOnlineState: {} }, (r) => {
         const s = (r && r.apOnlineState) || {};
-        if (s.token && !s.revoked && s.lastOkAt && Date.now() - s.lastOkAt <= AUTH_GRACE_MS) {
-          cb({ ok: true, mode: 'grace', source: 'online', reason: 'ok',
-            msg: '授权有效 · 后台服务恢复中', appKeyConfigured: true });
+        const now = Date.now();
+        let valid = false;
+        if (s.token && !s.revoked) {
+          if (s.expireAt > 0) {
+            valid = now <= s.expireAt + LOCAL_EXPIRE_VERIFY_GRACE_MS;
+          } else {
+            const base = s.lastOkAt || s.activatedAt || 0;
+            valid = !base || (now - base <= LOCAL_UNKNOWN_EXPIRE_MS);
+          }
+        }
+        if (valid) {
+          const shortBreak = s.lastOkAt && (now - s.lastOkAt <= 5 * 60 * 1000);
+          cb({ ok: true, mode: shortBreak ? 'grace' : 'disconnected', source: 'online',
+            reason: 'ok', awaitingReconnect: true,
+            msg: shortBreak ? '授权有效 · 后台服务恢复中'
+              : '授权有效 · 当前离线，联网后自动恢复，无需重新激活',
+            appKeyConfigured: true });
           return;
         }
         cb(offlineState());
@@ -248,7 +267,7 @@
         '<input class="ap-lic-input" id="ap-lic-input" type="text" placeholder="在线卡密 / 旧版离线码（AVP1 开头）均可" spellcheck="false">' +
         '<button class="ap-lic-btn" id="ap-lic-btn">激活</button>' +
       '</div>' +
-      '<div class="ap-lic-foot">两种授权均可使用：在线卡密需联网；旧版离线码无需联网，升级后自动继续有效。激活后立即生效、无需刷新。</div>';
+      '<div class="ap-lic-foot">两种授权均可使用：在线卡密激活一次即可，断网不会失效、联网后自动恢复，无需重新激活；旧版离线码（AVP1 开头）无需联网，升级后自动继续有效。</div>';
     (document.body || document.documentElement).appendChild(card);
     const btn = card.querySelector('#ap-lic-btn');
     const input = card.querySelector('#ap-lic-input');
