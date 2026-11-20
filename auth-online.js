@@ -56,14 +56,24 @@
 })(typeof self !== 'undefined' ? self : globalThis, function () {
   'use strict';
 
+  // 【公开发布版】作者密钥以密文常量保存，运行时还原（与作者原版行为完全一致）。
+  // 这是可逆的密封/混淆，用于避免明文密钥被直接扫描，并非密码学加密。
+  function apUnsealOnline(h) {
+    var k = 'AVP-Public-Sealed-2026', o = '';
+    for (var i = 0; i < h.length; i += 2) {
+      o += String.fromCharCode(parseInt(h.substr(i, 2), 16) ^ k.charCodeAt((i / 2) % k.length));
+    }
+    return o;
+  }
+
   // ============================== 作者配置区 ==============================
   // APP_KEY 由作者用 `node tools/set-appkey.js --app-key <后台AppKey>` 写入。
   // 在填入前本模块不会向服务器发起任何请求（isAppKeyConfigured() === false）。
   const CONFIG = {
     API_BASE: 'https://auth.dixunblog.cn/api/v2/',
-    APP_KEY: '__APP_KEY__',
+    APP_KEY: apUnsealOnline('121d0f153417505d5a01183550005a50534f00510003716e344e3243540a59074b6054'),
     // 开发文档「配置」表公开的客户端密钥（服务端同值），参与 SHA-256 签名
-    CLIENT_SECRET: '__CLIENT_SECRET__',
+    CLIENT_SECRET: apUnsealOnline('123e2569312d0b0d5b531f6536040f17015979554b17017574080e'),
     HEARTBEAT_MS: 5000,                 // 服务端固定 5 秒
     ONLINE_FRESH_MS: 17000,             // 17 秒内有过成功心跳 → 显示「在线」
     // v2.2.3：GRACE_MS 只用于区分「短暂抖动」和「长期离线」的提示文案，

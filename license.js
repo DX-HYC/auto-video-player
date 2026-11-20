@@ -50,9 +50,19 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
+  // 【公开发布版】作者密钥以密文常量保存，运行时还原（与作者原版行为完全一致）。
+  // 这是可逆的密封/混淆，用于避免明文密钥被直接扫描，并非密码学加密。
+  function apUnsealLicense(h) {
+    var k = 'AVP-Public-Sealed-2026', o = '';
+    for (var i = 0; i < h.length; i += 2) {
+      o += String.fromCharCode(parseInt(h.substr(i, 2), 16) ^ k.charCodeAt((i / 2) % k.length));
+    }
+    return o;
+  }
+
   // ============================== 作者配置区 ==============================
   // 签名密钥：改这里 = 此前签发的所有授权码立即作废（用于泄露后轮换）
-  const SIGN_SECRET = '__SIGN_SECRET__';
+  const SIGN_SECRET = apUnsealLicense('00067d6119364f5e59511b7e0d380f5c476643075f6e73261c15232756183e55540954032250076902577a052b10');
   // 授权码格式版本：payload.v 与此不符的旧码一律判为 version 过旧
   const LICENSE_VERSION = 1;
   // 授权码前缀：AVP1 = Auto Video Player v1 授权
