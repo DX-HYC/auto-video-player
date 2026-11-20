@@ -1,5 +1,66 @@
 # 更新日志
 
+### v2.2.4（2026-11-20）优化网梯平台「偶尔无法自动连播」
+
+**用户反馈**：网梯科技平台偶尔出现播完不跳、跳了不播、或反复停在同一节课。
+
+**六个偶发根因**
+
+1. 子帧 `reportVideoState()` 用 `postMessage` 上报 `localList`，其中 `container` / `leaves[].el`
+   是 DOM 元素，结构化克隆直接抛 `DataCloneError`，被 `postToTop` 的 try/catch 静默吞掉。
+   只要某个子帧识别出目录片段，该帧整条状态上报就消失，顶层看不到 iframe 里的视频，
+   「卡结尾补跳」时灵时不灵 —— 这是「偶尔」的主因。
+2. `clickNext()` 的 2 秒跳转校验只写日志（「⚠️ 当前项未变化」）不做补救，而
+   `lastClickAt`(4s) / `lastGlobalNextAt`(8s) 两个锁已经占用；视频播完不会再有 ended 事件，
+   于是这一节停住，只能等每分钟一次的后台闹钟。
+3. `dispatchNext()` 把跳转委派给子帧后没有回执：iframe 切课时被重建，消息无人接收，
+   8 秒锁内不重试，本次跳转直接丢失。
+4. 前台 3 秒主心跳里没有「停结尾」检测，只有后台 alarm（1 分钟）触发 `watchdogTick()`；
+   ended 事件在播放器重建时丢失就要等很久。
+5. `handlingEnd` 是布尔锁，靠 `setTimeout(2000)` 复位；后台标签页里 setTimeout 被节流到
+   分钟级，会把新一节课的 ended 事件整段吞掉。
+6. `localDoneMap` 只用 DOM 元素做 key，Vue 重渲染目录后引用失效、完成记账丢失，
+   `findNextItem()` 又会选中当前这一节，表现为「反复跳同一集 / 不前进」。
+
+**修复：新增网梯连播自愈层（只做确认与补偿，不改任何判定语义）**
+
+- `plainList()`：仅网梯 profile 下把 `localList` 转成纯数据副本上报，并预计算
+  `catalogReal`；`hasRealCatalogInList()` 优先采信该结论。跨帧视频状态稳定可见。
+- `armJumpVerify()` / `verifyJump()` / `retryJump()` / `finishJump()`：跳转后 2.2 秒确认
+  当前课时是否真的切换；未生效最多补偿 3 次，每次清掉跳转锁、重新分析目录。
+  **前两次重点同一目标**（平台状态可能只是刷新慢，不会跳课），第三次才顺序换目标；
+  目录高亮没刷新但新课时已起播也判成功，避免重复点击。用尽后停手并放开锁，等下一轮巡检；
+  确认成功后给 12 秒补跳冷却，防止旧视频的「已结束」状态在 frameStates 里残留造成重复跳课。
+- `itemKey()` + `localDoneKeys`：基于网梯 itemId（其次课时文本）的稳定完成记账，
+  SPA 重渲染后仍有效；`nextHealTarget()` 跳过上次点过没生效的目标、跳过已完成课时，
+  按目录顺序推进，不再原地打转。
+- 子帧跳转点击发 `nextAck` 回执，顶层统一确认（子帧各自补偿会重复点击）；
+  `delegatedNextAt` 超过 3.5 秒无回执时顶层接管重试。
+- `whatyHealTick()` 接入顶层 3 秒心跳：`whatyStuckEnded()` 识别「paused 停在结尾」
+  （原 `hasStuckEndedVideo()` 要求 `!paused`，网梯播完自动暂停会漏判），12 秒节流后
+  主动 `dispatchNext()`；不再只依赖每分钟一次的后台闹钟。
+- 确认切课后立即 + 1.5s + 3.5s 三次 `broadcastDown({type:'ping', play:true})`，
+  各级 iframe 收到后立刻 `ensurePlaying()`，覆盖 iframe 重建时序，修「跳了不播」。
+- `handlingEnd` → `handlingEndAt` 时间戳判定，后台节流下按真实时间自然过期。
+- SPA 路由变化时重置 `pendingNext` / `lastAutoTarget` / 委派与回执时刻，避免旧一轮干扰。
+
+**隔离与边界**
+
+- 全部新增逻辑由 `whatyHealOn()` 把关：必须 `ACTIVE_PROFILE === 'whaty'`、平台未被前台停用、
+  已完整启动且开启自动连播。`jxnu` / `generic` 完全不走这一层；跨帧纯数据上报同样只在网梯生效。
+- **未改动冻结语义**：`findWangtiCatalog()` / `hasCompletedMarker()` / `hasCurrentMarker()`
+  与 `PLATFORMS.frozen` 原样保留，`tests/selftest_whaty_frozen.js` 继续作为回归门禁。
+- 补偿有上限（3 次）且有节流，不会连点乱跳；用户手动暂停、手动下一集不触发自愈。
+- 授权 / 心跳 / UI / 在线离线双通道行为不变。
+
+**测试**
+
+- 新增 `tests/selftest_whaty_heal.js`（68 项）：21 条源码隔离断言 + 47 条行为仿真
+  （平台隔离、纯数据克隆、停结尾判定、目标去重、补偿次数上限、成功起播唤醒、前台巡检兜底、
+  成功后的 12 秒冷却防重复跳课）。
+- `tests/selftest_robust.js` 的 C9 断言同步为「ping 带 play 标记透传」。
+- 全量回归 `node tests/run-all.js` **392/392 通过**。
+
 ### v2.2.3（2026-11-14）修复「已授权用户断网太久又要重新授权」
 
 **用户反馈**：已授权用户断网时间稍长就弹出「插件未授权 · 与授权服务器断开过久，请检查网络或重新激活」。用户不可能 7×24 在线，断网后重新联网且仍在正常授权期限内的，不应重复授权。

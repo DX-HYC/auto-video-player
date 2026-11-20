@@ -448,12 +448,25 @@
   // 不会永久跳过，保证"播完自动补齐漏看课时"的能力不受影响。
   const localDoneMap = new Map(); // el -> 记账时间戳
   const LOCAL_DONE_TTL = 10 * 60 * 1000;
+  // v2.2.4：网梯切课时 Vue 会把目录整体重渲染，元素引用失效会让 localDoneMap 丢账，
+  // 下一轮又选中同一节课。额外记一份「稳定 key」账本，仅网梯 profile 使用。
+  const localDoneKeys = new Map(); // key -> 记账时间戳
   function markLocalDone(el) {
-    try { if (el) localDoneMap.set(el, Date.now()); } catch (e) {}
+    try {
+      if (!el) return;
+      const t = Date.now();
+      localDoneMap.set(el, t);
+      if (ACTIVE_PROFILE === 'whaty') {
+        const k = itemKey({ el: el, text: getAllText(el) });
+        if (k) localDoneKeys.set(k, t);
+      }
+    } catch (e) {}
   }
   let currentVideo = null;
   let lastEndedVideo = null;
-  let handlingEnd = false;
+  // v2.2.4：布尔锁依赖 setTimeout(2000) 复位，后台标签页里它被节流到分钟级，
+  // 会把新一节课的 ended 事件整段吞掉。改用时间戳，按真实时间自然过期。
+  let handlingEndAt = 0;
   let lastClickAt = 0;
   let panel = null;
   let infoTimer = null;
@@ -488,6 +501,16 @@
   let localList = { container: null, all: [], leaves: [], chapterHeaders: [], current: null, completed: [], pending: [], leafCount: 0 };
   let frameStates = {};
   let lastGlobalNextAt = 0;
+
+  // ---------- v2.2.4 网梯连播自愈层（仅 ACTIVE_PROFILE === 'whaty' 生效） ----------
+  // 网梯是「顶层目录 + 多 iframe 播放器」架构，切课时 iframe 会重建、Vue 目录会局部
+  // 刷新，偶发出现：点击没生效、跨帧状态丢失、ended 没触发、跳完不起播。
+  // 这一层只做「确认 + 有限补偿 + 主动起播」，不改任何目录识别 / 完成判定语义。
+  let pendingNext = null;       // { beforeKey, targetKey, url, at, tries }
+  let lastAutoTarget = null;    // { key, at }：防止反复跳同一节课
+  let delegatedNextAt = 0;      // 委派给子帧的时刻
+  let nextAckAt = 0;            // 子帧回执时刻
+  let lastHealAt = 0;           // 前台自愈节流
 
   // ---------- 设置同步 ----------
   const SETTINGS_VERSION = '2.0.0';
@@ -901,8 +924,8 @@
   function onEnded(e) {
     const video = e.target;
     if (!settings.enabled || !settings.autoNext) return;
-    if (handlingEnd && lastEndedVideo === video) return;
-    handlingEnd = true;
+    if (lastEndedVideo === video && Date.now() - handlingEndAt < 2000) return;
+    handlingEndAt = Date.now();
     lastEndedVideo = video;
     userPaused.delete(video);
     log('视频播放结束');
@@ -910,14 +933,13 @@
     try { if (localList.current && localList.current.el) markLocalDone(localList.current.el); } catch (err) {}
     const handled = clickNext(false, true);
     postToTop({ type: 'ended', handled: !!handled });
-    setTimeout(() => { handlingEnd = false; }, 2000);
   }
 
   function onPlaying(e) {
     const video = e.target;
     currentVideo = video;
     userPaused.delete(video);
-    if (video === lastEndedVideo) { lastEndedVideo = null; handlingEnd = false; }
+    if (video === lastEndedVideo) { lastEndedVideo = null; handlingEndAt = 0; }
     // 播放器可能在加载新视频时重置倍速，这里重新应用
     applySpeed(video);
   }
@@ -1697,12 +1719,29 @@
     return arr;
   }
 
+  // v2.2.4：postMessage 用结构化克隆，localList 里的 DOM 引用（container /
+  // leaves[].el）会直接抛 DataCloneError；postToTop 把它吞掉后子帧状态上报整条消失，
+  // 顶层就看不到 iframe 里的视频，「播完卡结尾补跳」时灵时不灵 —— 这正是网梯
+  // 「偶尔连不上」的主因之一。仅网梯 profile 转成纯数据上报，其他平台保持原样。
+  function plainList(list) {
+    const leaves = (list && list.leaves) || [];
+    return {
+      container: null, all: [], leaves: [], chapterHeaders: [],
+      current: list && list.current ? { text: list.current.text || '' } : null,
+      completed: [], pending: [],
+      leafCount: leaves.length,
+      currentPct: list && typeof list.currentPct === 'number' ? list.currentPct : -1,
+      catalogReal: hasRealCatalogInList(list),
+      plain: true
+    };
+  }
+
   function reportVideoState() {
     localVideos = getLocalVideoState().concat(shadowAsState());
     const payload = {
       type: 'state',
       videos: localVideos,
-      list: localList,
+      list: ACTIVE_PROFILE === 'whaty' ? plainList(localList) : localList,
       frameTag: getFrameTag(),
       frameUrl: location.href,
       ts: Date.now()
@@ -2150,6 +2189,19 @@
     return null;
   }
 
+  // v2.2.4：给课时算一个跨 DOM 重渲染仍稳定的标识（优先网梯 itemId，其次课时文本）
+  function itemKey(it) {
+    if (!it) return '';
+    const el = it.el || (it.getAttribute ? it : null);
+    try {
+      const id = getItemId(el);
+      if (id) return 'id:' + id;
+    } catch (e) {}
+    let t = '';
+    try { t = String(it.text || (el ? getAllText(el) : '') || '').trim().slice(0, 60); } catch (e) {}
+    return t ? 't:' + t : '';
+  }
+
   function urlsLookRelated(a, b) {
     if (!a || !b) return false;
     if (a === b) return true;
@@ -2490,6 +2542,15 @@
         if (!el || nowDone - ts > LOCAL_DONE_TTL) { localDoneMap.delete(el); return; }
         if (container.contains(el)) completedByMarker.add(el);
       });
+      // v2.2.4 网梯：目录重渲染后旧元素引用失效，用稳定 key 补回完成记账
+      if (ACTIVE_PROFILE === 'whaty' && localDoneKeys.size) {
+        localDoneKeys.forEach((ts, k) => {
+          if (nowDone - ts > LOCAL_DONE_TTL) { localDoneKeys.delete(k); return; }
+          for (const it of leaves) {
+            if (itemKey(it) === k) completedByMarker.add(it.el);
+          }
+        });
+      }
     } catch (e) {}
 
     // 防误报：如果所有课时都被标成已完成，而当前还有正在播放且未结束的视频，大概率是误匹配
@@ -2773,6 +2834,15 @@
         }
       } catch (e) {}
       const beforeText = localList.current ? localList.current.text.slice(0, 40) : '';
+      // v2.2.4 网梯：登记本次自动跳转，2.2 秒后由顶层确认是否真的切换了课时。
+      // 子帧只回执，不在本帧确认，避免多级 iframe 各自补偿造成跳课。
+      if (whatyHealOn() && autoEnded) {
+        const bKey = currentKey();
+        const tKey = itemKey(next);
+        lastAutoTarget = { key: tKey, at: Date.now() };
+        if (IS_TOP) armJumpVerify(bKey, tKey, location.href);
+        else postToTop({ type: 'nextAck', ok: true, targetKey: tKey, url: location.href });
+      }
       smartClick(next.el, (ok) => {
         if (ok) log('跳转成功');
         else log('跳转可能失败，元素不可见');
@@ -3095,6 +3165,8 @@
   // 判断某帧的目录是否为"真实课程目录"。
   // 网梯/whaty 平台有专属标记；其余平台走通用判断，避免写死导致新平台失效。
   function hasRealCatalogInList(list) {
+    // 跨帧传来的纯数据副本无法携带 DOM 引用，结论已在源帧预计算好
+    if (list && typeof list.catalogReal === 'boolean') return list.catalogReal;
     const leaves = (list && list.leaves) || [];
     if (!leaves.length) return false;
 
@@ -3173,8 +3245,161 @@
       return clickNext(true, true);
     }
     log(reason, '委派下一集到', best.frameTag);
+    if (ACTIVE_PROFILE === 'whaty') delegatedNextAt = Date.now();
     broadcastDown({ type: 'clickNext', bestFrameTag: best.frameTag, manual: false });
     return true;
+  }
+
+  // ==========================================================================
+  // v2.2.4 网梯连播自愈层
+  // 严格限定：只有网梯 profile、平台未被前台停用、完整启动后才介入；
+  // jxnu / generic 完全不走这一层，保证「优化网梯不影响其他平台」。
+  // ==========================================================================
+  function whatyHealOn() {
+    return ACTIVE_PROFILE === 'whaty' && !!fullStarted && activePlatformAllowed() &&
+      !!(settings && settings.enabled && settings.autoNext);
+  }
+
+  function currentKey() {
+    try { return localList.current ? itemKey(localList.current) : ''; } catch (e) { return ''; }
+  }
+
+  // 「已播完 / 停在结尾」判定：与 hasStuckEndedVideo 不同，网梯播完常自动暂停，
+  // paused 停在结尾也要算；同时要求时长 >= 20s、已播 > 5s，避免刚起播被误判。
+  function whatyStuckEnded() {
+    try {
+      return getAggregatedVideos().some(v =>
+        v && isFinite(v.duration) && v.duration >= 20 &&
+        (v.currentTime || 0) > 5 &&
+        (v.ended || v.duration - (v.currentTime || 0) <= 1.5)
+      );
+    } catch (e) { return false; }
+  }
+
+  // 补偿时重新选目标：优先「当前项之后的第一个未完成课时」，并跳过上一次
+  // 点过却没生效的目标，避免 Vue 状态没刷新时反复点同一节课。
+  function nextHealTarget() {
+    analyzeList();
+    const leaves = localList.all.slice();
+    if (!leaves.length) return null;
+    const lastKey = (lastAutoTarget && Date.now() - lastAutoTarget.at < 180000) ? lastAutoTarget.key : '';
+    const curIdx = localList.current ? leaves.findIndex(it => it.el === localList.current.el) : -1;
+    for (let i = curIdx + 1; i < leaves.length; i++) {
+      if (leaves[i].state === 'completed' || itemKey(leaves[i]) === lastKey) continue;
+      return leaves[i];
+    }
+    for (const it of leaves) {
+      if (it.state === 'completed' || itemKey(it) === lastKey) continue;
+      return it;
+    }
+    return null;
+  }
+
+  function armJumpVerify(beforeKey, targetKey, url) {
+    // 确认只在顶层做：子帧各自确认会与顶层重复点击，反而可能跳课
+    if (!IS_TOP || !whatyHealOn() || pendingNext) return;
+    pendingNext = { beforeKey: beforeKey || '', targetKey: targetKey || '', url: url || location.href,
+                    at: Date.now(), tries: 0 };
+    setTimeout(verifyJump, 2200);
+  }
+
+  function finishJump(ok) {
+    pendingNext = null;
+    handlingEndAt = 0;
+    lastEndedVideo = null;
+    delegatedNextAt = 0;
+    nextAckAt = 0;
+    if (!ok) {
+      lastClickAt = 0;   // 放开锁，让后续巡检还能再试
+      lastGlobalNextAt = 0;
+      lastHealAt = Date.now();   // 冷却，避免失败后立刻重试风暴
+      log('⚠️ 自动连播：补偿后仍未切换课时，等待下一轮巡检');
+      return;
+    }
+    // 刚确认跳转成功：旧视频的「已结束」状态可能还在 frameStates 里残留 10 秒，
+    // 这里给 12 秒冷却，防止巡检把它当成「又播完一集」而重复跳课。
+    lastGlobalNextAt = Date.now();
+    lastHealAt = Date.now();
+    lastAutoTarget = null;
+    // lastClickAt 保留：ensurePlaying 靠它识别「刚跳过、应主动起播」
+    log('自动连播：已确认切换到新课时，唤醒各级 iframe 起播');
+    // 覆盖 iframe 重建时序：立即 + 1.5s + 3.5s 三次唤醒
+    const wake = () => {
+      if (!whatyHealOn()) return;
+      try { ensurePlaying(); } catch (e) {}
+      try { broadcastDown({ type: 'ping', play: true }); } catch (e) {}
+    };
+    wake();
+    setTimeout(wake, 1500);
+    setTimeout(wake, 3500);
+  }
+
+  function verifyJump() {
+    if (!pendingNext || !whatyHealOn()) return;
+    try {
+      analyzeList();
+      let changed = false;
+      const nowKey = currentKey();
+      if (location.href !== pendingNext.url) changed = true;
+      if (nowKey && pendingNext.beforeKey && nowKey !== pendingNext.beforeKey) changed = true;
+      if (!pendingNext.beforeKey && nowKey && nowKey !== pendingNext.targetKey) changed = true;
+      // 目录高亮刷新慢但新课时已经播起来了：也算成功，避免重复点击把课跳过去
+      if (!changed) {
+        const fresh = getAggregatedVideos().some(v => v && !v.paused &&
+          isFinite(v.duration) && v.duration >= 20 &&
+          (v.currentTime || 0) < Math.min(15, v.duration * 0.1));
+        if (fresh) changed = true;
+      }
+      if (changed) { log('跳转校验：当前项已切换'); finishJump(true); return; }
+      log('跳转校验：⚠️ 当前项未变化，准备第 ' + (pendingNext.tries + 1) + ' 次补偿');
+      if (pendingNext.tries >= 3) { finishJump(false); return; }
+      retryJump();
+    } catch (e) { finishJump(false); }
+  }
+
+  function retryJump() {
+    if (!pendingNext) return;
+    pendingNext.tries++;
+    lastClickAt = 0;
+    lastGlobalNextAt = 0;
+    handlingEndAt = 0;
+    // 前两次重试同一个目标（平台状态可能只是刷新慢，重复点同一节不会跳课）；
+    // 第三次才顺序换目标，避免真卡死时永远原地打转。
+    let next = null;
+    if (pendingNext.tries < 3 && pendingNext.targetKey) {
+      analyzeList();
+      next = localList.all.find(it => itemKey(it) === pendingNext.targetKey) || null;
+    }
+    if (!next) next = nextHealTarget();
+    if (!next) { log('自动连播：目录里没有可继续的课时'); finishJump(false); return; }
+    const key = itemKey(next);
+    lastAutoTarget = { key: key, at: Date.now() };
+    lastClickAt = Date.now();
+    try { if (localList.current && localList.current.el) markLocalDone(localList.current.el); } catch (e) {}
+    log('自动连播补偿第 ' + pendingNext.tries + ' 次：', next.text.slice(0, 40));
+    pendingNext.targetKey = key;
+    smartClick(next.el, () => {});
+    try { broadcastDown({ type: 'ping', play: true }); } catch (e) {}
+    setTimeout(verifyJump, 2600);
+  }
+
+  // 顶层 3 秒巡检：① 子帧委派无回执 ② ended 丢失 / 停结尾没跳
+  function whatyHealTick() {
+    if (!IS_TOP || !whatyHealOn()) return;
+    const now = Date.now();
+    if (delegatedNextAt && now - delegatedNextAt > 3500 && nextAckAt < delegatedNextAt) {
+      delegatedNextAt = 0;
+      log('⚠️ 子帧未在 3.5 秒内确认跳转，顶层接管');
+      lastClickAt = 0;
+      lastGlobalNextAt = 0;
+      const ok = clickNext(true, true);
+      if (!ok) { try { broadcastDown({ type: 'ping', play: true }); } catch (e) {} }
+    }
+    if (!pendingNext && whatyStuckEnded() &&
+        now - lastGlobalNextAt > 12000 && now - lastHealAt > 10000) {
+      lastHealAt = now;
+      dispatchNext('网梯自愈：视频已结束但未跳转', true);
+    }
   }
 
   function updateInfo() {
@@ -3313,7 +3538,9 @@
       // 收到 ping 立即扫描上报，并继续向本级子 iframe 转发 ——
       // 否则孙辈 iframe（iframe 里的 iframe）永远收不到顶层的心跳
       analyzeAndReport();
-      if (d.broadcastDown) { try { broadcastDown({ type: 'ping' }); } catch (e) {} }
+      // v2.2.4 网梯：跳转确认后由顶层下发 play 标记，让刚重建的播放器帧立即起播
+      if (d.play && ACTIVE_PROFILE === 'whaty') { try { ensurePlaying(); } catch (e) {} }
+      if (d.broadcastDown) { try { broadcastDown({ type: 'ping', play: !!d.play }); } catch (e) {} }
       return;
     }
 
@@ -3355,6 +3582,15 @@
       return;
     }
 
+    if (d.type === 'nextAck' && IS_TOP) {
+      // 子帧完成了跳转点击：记录回执，并由顶层统一做「是否真的切换」的确认
+      nextAckAt = Date.now();
+      if (whatyHealOn() && !pendingNext) {
+        armJumpVerify(currentKey(), d.targetKey || '', d.url || location.href);
+      }
+      return;
+    }
+
     if (d.type === 'ended' && IS_TOP) {
       if (!d.handled) dispatchNext('视频结束：', true);
     }
@@ -3385,8 +3621,13 @@
       log('检测到路由变化，重新分析：', now.slice(0, 120));
       // 重置上一轮跳转状态，避免旧锁与旧视频残留影响新一轮
       lastClickAt = 0;
-      handlingEnd = false;
+      handlingEndAt = 0;
       lastEndedVideo = null;
+      // v2.2.4：换课时清掉上一轮自愈状态，避免旧确认/旧目标干扰新一轮连播
+      pendingNext = null;
+      lastAutoTarget = null;
+      delegatedNextAt = 0;
+      nextAckAt = 0;
       // 切换课时后播放器会重建：重置自定义播放器的位置追踪，给它一个全新的判停窗口
       customPrev.key = '';
       customPrev.cur = -1;
@@ -3586,6 +3827,7 @@
           customPlayerTick();
           checkShadowVideos();
           catalogDrivenTick();
+          whatyHealTick();
           if (panel) updateInfo();
         } catch (e) { log('tick error', (e && e.message) || e); }
         // 定时 ping 子帧，防止 iframe 加载晚于 content script（降低频率减少开销与风险）
